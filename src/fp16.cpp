@@ -24,11 +24,8 @@ namespace
         float value)
     {
         const std::uint32_t bits = floatToBits(value);
-
         const std::uint32_t sign = (bits >> 16) & 0x8000U;
-
         const std::uint32_t exponent = (bits >> 23) & 0xFFU;
-
         const std::uint32_t mantissa = bits & 0x7FFFFFU;
 
         if (exponent == 0xFFU)
@@ -63,11 +60,8 @@ namespace
             }
 
             std::uint32_t subnormal_mantissa = mantissa | 0x800000U;
-
             const int shift = 14 - half_exponent;
-
             std::uint32_t half_mantissa = subnormal_mantissa >> shift;
-
             const std::uint32_t round_bit = std::uint32_t{1} << (shift - 1);
 
             if ((subnormal_mantissa & round_bit) != 0)
@@ -79,7 +73,6 @@ namespace
         }
 
         std::uint32_t half_mantissa = mantissa >> 13;
-
         const std::uint32_t remainder = mantissa & 0x1FFFU;
 
         if (remainder > 0x1000U || (remainder == 0x1000U && (half_mantissa & 1U)))
@@ -99,18 +92,14 @@ namespace
                 return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(rounded_exponent) << 10));
             }
         }
-
         return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(half_exponent) << 10) | half_mantissa);
     }
 
     float halfToFloat(std::uint16_t half)
     {
         const std::uint32_t sign = (static_cast<std::uint32_t>(half) & 0x8000U) << 16;
-
         const std::uint32_t exponent = (static_cast<std::uint32_t>(half) >> 10) & 0x1FU;
-
         std::uint32_t mantissa = static_cast<std::uint32_t>(half) & 0x3FFU;
-
         std::uint32_t float_bits = 0;
 
         if (exponent == 0)
@@ -122,7 +111,6 @@ namespace
             else
             {
                 int normalized_exponent = -14;
-
                 while ((mantissa & 0x400U) == 0)
                 {
                     mantissa <<= 1;
@@ -130,9 +118,7 @@ namespace
                 }
 
                 mantissa &= 0x3FFU;
-
                 const std::uint32_t float_exponent = static_cast<std::uint32_t>(normalized_exponent + 127);
-
                 float_bits = sign | (float_exponent << 23) | (mantissa << 13);
             }
         }
@@ -145,7 +131,6 @@ namespace
         else
         {
             const std::uint32_t float_exponent = exponent - 15 + 127;
-
             float_bits = sign | (float_exponent << 23) | (mantissa << 13);
         }
 
@@ -157,13 +142,10 @@ namespace
 FP16EncodedTensor FP16Quantizer::encode(const std::vector<float> &input) const
 {
     FP16EncodedTensor encoded;
-
     encoded.value_count_ = input.size();
-
     for (float value : input)
     {
         const std::uint16_t half = floatToHalf(value);
-
         encoded.bits_.writeBits(half, 16);
     }
     return encoded;
@@ -172,11 +154,9 @@ FP16EncodedTensor FP16Quantizer::encode(const std::vector<float> &input) const
 std::vector<float> FP16Quantizer::decode(const FP16EncodedTensor &encoded) const
 {
     std::vector<float> output;
-
     output.reserve(encoded.value_count_);
-
     std::size_t bit_offset = 0;
-
+    
     for (std::size_t i = 0; i < encoded.value_count_; ++i)
     {
         const std::uint16_t half = static_cast<std::uint16_t>(encoded.bits_.readBits(bit_offset, 16));

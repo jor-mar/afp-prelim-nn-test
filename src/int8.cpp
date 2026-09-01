@@ -44,7 +44,17 @@ INT8EncodedTensor INT8Quantizer::encode(const std::vector<float> &input) const
     {
         int quantized = static_cast<int>(std::round(value / encoded.scale_));
 
-        quantized = std::clamp(quantized, -127, 127);
+        // quantized = std::clamp(quantized, -127, 127);
+
+        if (quantized < -127)
+        {
+            quantized = -127;
+        }
+        else if (quantized > 127)
+        {
+            quantized =127;
+        }
+
 
         const std::int8_t int8_value = static_cast<std::int8_t>(quantized);
 

@@ -19,6 +19,5 @@ class FP16Quantizer
 {
 public:
     FP16EncodedTensor encode(const std::vector<float>& input) const;
-
     std::vector<float> decode(const FP16EncodedTensor& encoded) const;
 };

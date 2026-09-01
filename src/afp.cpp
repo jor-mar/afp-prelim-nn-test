@@ -1,6 +1,6 @@
 #include "../include/afp.hpp"
 
-#include "quantization_utils.hpp"
+#include "../include/quantization_utils.hpp"
 
 #include <algorithm>
 #include <cmath>
