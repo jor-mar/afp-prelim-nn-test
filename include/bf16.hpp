@@ -11,16 +11,14 @@ public:
   {
     return "BF16";
   }
+private:
+  friend class BF16Quantizer;
 };
 
 class BF16Quantizer
 {
 public:
-  BF16EncodedTensor encode(
-    const std::vector<float>& input
-  ) const;
+  BF16EncodedTensor encode(const std::vector<float>& input) const;
 
-  std::vector<float> decode(
-    const BF16EncodedTensor& encoded
-  ) const;
+  std::vector<float> decode(const BF16EncodedTensor& encoded) const;
 };

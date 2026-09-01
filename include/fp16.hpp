@@ -2,7 +2,6 @@
 
 #include "encoded_tensor.hpp"
 
-#include <cstdint>
 #include <vector>
 
 class FP16EncodedTensor : public EncodedTensor
@@ -12,16 +11,14 @@ public:
     {
         return "FP16";
     }
+private:
+    friend class FP16Quantizer;
 };
 
 class FP16Quantizer
 {
 public:
-    FP16EncodedTensor encode(
-        const std::vector<float>& input
-    ) const;
+    FP16EncodedTensor encode(const std::vector<float>& input) const;
 
-    std::vector<float> decode(
-        const FP16EncodedTensor& encoded
-    ) const;
+    std::vector<float> decode(const FP16EncodedTensor& encoded) const;
 };
