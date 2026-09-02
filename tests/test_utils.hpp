@@ -2,7 +2,6 @@
 
 #include <cmath>
 #include <cstddef>
-#include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,19 +17,20 @@ namespace test_utils
         return failures;
     }
 
+    std::vector<std::string> &failedTests()
+    {
+        static std::vector<std::string> failures;
+        return failures;
+    }
+
     void expect(
         bool condition,
-        const std::string &test_name
-    )
+        const std::string &test_name)
     {
-        if (condition)
+        if (!condition)
         {
-            std::cout << "[PASS] " << test_name << '\n';
-        }
-        else
-        {
-            std::cerr << "[FAIL] " << test_name << '\n';
             ++failureCount();
+            failedTests().push_back(test_name);
         }
     }
 
@@ -38,26 +38,29 @@ namespace test_utils
         double actual,
         double expected,
         double tolerance,
-        const std::string &test_name
-    )
+        const std::string &test_name)
     {
         const bool passed = std::abs(actual - expected) <= tolerance;
 
-        expect(passed, test_name);
-
         if (!passed)
         {
-            std::cerr << "\tExpected: " << expected << '\n';
-            std::cerr << "\tActual: " << actual << '\n';
-            std::cerr << "\tTolerance: " << tolerance << '\n';
+            ++failureCount();
+            failedTests().push_back(test_name);
+
+            std::cerr << "[FAIL] " << test_name << '\n';
+            std::cerr << "    Expected: " << expected << '\n';
+            std::cerr << "    Actual:   " << actual << '\n';
+            std::cerr << "    Tolerance: " << tolerance << '\n';
+        }
+        else {
+            std::cout << "[PASS]" << test_name << '\n';
         }
     }
 
     template <typename Function>
     void expectThrows(
         const std::string &test_name,
-        Function &&function
-    )
+        Function &&function)
     {
         bool threw = false;
 
@@ -76,8 +79,7 @@ namespace test_utils
     bool vectorsNear(
         const std::vector<float> &actual,
         const std::vector<float> &expected,
-        float tolerance
-    )
+        float tolerance)
     {
         if (actual.size() != expected.size())
         {
@@ -97,13 +99,26 @@ namespace test_utils
 
     int finish()
     {
+        std::cout << "\n========================================\n";
+
         if (failureCount() == 0)
         {
             std::cout << "ALL TESTS PASSED\n";
+            std::cout << "========================================\n";
             return 0;
         }
 
-        std::cerr << failureCount() << " TEST(S) FAILED\n";
+        std::cout << failureCount() << " TEST(S) FAILED\n\n";
+
+        std::cout << "Failed tests:\n";
+
+        for (const std::string &test_name : failedTests())
+        {
+            std::cout << "  - " << test_name << '\n';
+        }
+
+        std::cout << "========================================\n";
+
         return 1;
     }
 }

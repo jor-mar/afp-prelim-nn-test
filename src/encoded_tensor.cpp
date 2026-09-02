@@ -22,10 +22,7 @@ double EncodedTensor::bitsPerValue() const
         return 0.0;
     }
 
-    return static_cast<double>(
-               bitSize()) /
-           static_cast<double>(
-               value_count_);
+    return static_cast<double>(bitSize()) / static_cast<double>(value_count_);
 }
 
 const BitStream &EncodedTensor::bitStream() const

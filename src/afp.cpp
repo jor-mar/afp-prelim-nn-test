@@ -1,77 +1,248 @@
 #include "../include/afp.hpp"
 
-#include "../include/quantization_utils.hpp"
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace
 {
-    std::int64_t signExtend(std::uint64_t value, int bits)
+    constexpr std::uint32_t exponent_mask = 0x7F800000U;
+    constexpr std::uint32_t fraction_mask = 0x007FFFFFU;
+
+    constexpr int fp32_exponent_bias = 127;
+    constexpr int fp32_fraction_bits = 23;
+
+    constexpr int block_size = 16;
+    constexpr int half_block_size = 8;
+
+    constexpr int maximum_offset = 7;
+
+    constexpr std::uint8_t first_half_positive_bit = 0;
+    constexpr std::uint8_t second_half_positive_bit = 1;
+
+    std::uint32_t floatBits(float value)
     {
-        if (bits <= 0 || bits >= 64)
-        {
-            return static_cast<std::int64_t>(value);
-        }
-
-        const std::uint64_t sign_bit = std::uint64_t{1} << (bits - 1);
-
-        if ((value & sign_bit) == 0)
-        {
-            return static_cast<std::int64_t>(value);
-        }
-
-        const std::uint64_t extension_mask = ~((std::uint64_t{1} << bits) - 1);
-
-        return static_cast<std::int64_t>(value | extension_mask);
+        std::uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
     }
 
-    std::uint64_t encodeSigned(std::int64_t value, int bits)
+    std::uint64_t bitMask(int bit_count)
     {
-        if (bits <= 0 || bits > 63)
+        if (bit_count <= 0)
+            return 0;
+
+        return (std::uint64_t{1} << bit_count) - 1;
+    }
+
+    std::uint64_t roundShiftRight(std::uint64_t value, int shift)
+    {
+        if (shift <= 0)
+            return value << -shift;
+
+        if (shift >= 64)
+            return 0;
+
+        const std::uint64_t truncated = value >> shift;
+        const std::uint64_t remainder = value & ((std::uint64_t{1} << shift) - 1);
+        const std::uint64_t halfway = std::uint64_t{1} << (shift - 1);
+
+        if (remainder > halfway)
+            return truncated + 1;
+
+        if (remainder == halfway && (truncated & 1))
+            return truncated + 1;
+
+        return truncated;
+    }
+
+    void validateConfig(const AFPConfig &config)
+    {
+        if (config.block_size != block_size)
+            throw std::invalid_argument("AFP8 requires a block size of 16");
+
+        if (config.exponent_bits != 8)
+            throw std::invalid_argument("AFP8 requires an 8-bit shared exponent");
+
+        if (config.characterization_bits != 8)
+            throw std::invalid_argument("AFP8 requires an 8-bit characterization field");
+
+        if (config.offset_bits != 3)
+            throw std::invalid_argument("AFP8 requires a 3-bit offset");
+
+        if (config.mantissa_bits != 5)
+            throw std::invalid_argument("AFP8 requires a 5-bit mantissa");
+
+        if (!config.enable_positive_fields)
+            throw std::invalid_argument("AFP8 requires positive fields");
+
+        if (config.enable_zero_fields)
+            throw std::invalid_argument("AFP8 does not use zero fields");
+    }
+
+    int unbiasedExponent(float value)
+    {
+        const std::uint32_t bits = floatBits(value);
+        const int exponent = static_cast<int>((bits & exponent_mask) >> fp32_fraction_bits);
+
+        if (exponent == 0)
+            return -126;
+
+        return exponent - fp32_exponent_bias;
+    }
+
+    std::uint32_t significand(float value)
+    {
+        const std::uint32_t bits = floatBits(value);
+        const std::uint32_t exponent = (bits & exponent_mask) >> fp32_fraction_bits;
+        const std::uint32_t fraction = bits & fraction_mask;
+
+        if (exponent == 0)
+            return fraction;
+
+        return (std::uint32_t{1} << fp32_fraction_bits) | fraction;
+    }
+
+    bool halfIsPositive(const std::vector<float> &input, std::size_t start, std::size_t end)
+    {
+        for (std::size_t i = start; i < end; ++i)
         {
-            throw std::invalid_argument("Invalid exponent bit width");
+            if (input[i] < 0.0f)
+                return false;
         }
 
-        const std::int64_t minimum = -(std::int64_t{1} << (bits - 1));
+        return true;
+    }
 
-        const std::int64_t maximum = (std::int64_t{1} << (bits - 1)) - 1;
+    int sharedExponent(const std::vector<float> &block)
+    {
+        bool found_nonzero = false;
+        int maximum = -126;
 
-        if (value < minimum || value > maximum)
+        for (float value : block)
         {
-            throw std::out_of_range("Exponent cannot fit in configured bit width");
+            if (value == 0.0f)
+                continue;
+
+            const int exponent = unbiasedExponent(std::fabs(value));
+
+            if (!found_nonzero || exponent > maximum)
+            {
+                maximum = exponent;
+                found_nonzero = true;
+            }
         }
 
-        const std::uint64_t mask = (std::uint64_t{1} << bits) - 1;
+        return maximum;
+    }
 
-        return static_cast<std::uint64_t>(value) & mask;
+    std::uint8_t encodeSharedExponent(int exponent)
+    {
+        if (exponent < -126 || exponent > 127)
+            throw std::out_of_range("AFP shared exponent is outside FP32 normal range");
+
+        return static_cast<std::uint8_t>(exponent + fp32_exponent_bias);
+    }
+
+    int decodeSharedExponent(std::uint8_t exponent)
+    {
+        if (exponent == 0)
+            return -126;
+
+        return static_cast<int>(exponent) - fp32_exponent_bias;
+    }
+
+    std::uint64_t encodeMantissa(float magnitude,
+                                 int exponent,
+                                 int offset,
+                                 int mantissa_bits)
+    {
+        if (magnitude == 0.0f)
+            return 0;
+
+        const double scaled = std::ldexp(
+            static_cast<double>(magnitude),
+            -(exponent - offset));
+
+        if (offset < maximum_offset)
+        {
+            const double fraction = scaled - 1.0;
+            const double factor = static_cast<double>(std::uint64_t{1} << mantissa_bits);
+
+            std::uint64_t mantissa = static_cast<std::uint64_t>(
+                std::nearbyint(fraction * factor));
+
+            const std::uint64_t maximum = bitMask(mantissa_bits);
+
+            if (mantissa > maximum)
+                mantissa = maximum;
+
+            return mantissa;
+        }
+
+        const double factor = std::ldexp(
+            1.0,
+            exponent - maximum_offset - mantissa_bits);
+
+        std::uint64_t mantissa = static_cast<std::uint64_t>(
+            std::nearbyint(static_cast<double>(magnitude) / factor));
+
+        const std::uint64_t maximum = bitMask(mantissa_bits);
+
+        if (mantissa > maximum)
+            mantissa = maximum;
+
+        return mantissa;
+    }
+
+    float decodeValue(bool negative,
+                      int exponent,
+                      int offset,
+                      std::uint64_t mantissa,
+                      int mantissa_bits)
+    {
+        if (offset == maximum_offset && mantissa == 0)
+            return 0.0f;
+
+        double magnitude;
+
+        if (offset < maximum_offset)
+        {
+            const double fraction =
+                static_cast<double>(mantissa) /
+                static_cast<double>(std::uint64_t{1} << mantissa_bits);
+
+            magnitude = std::ldexp(1.0 + fraction, exponent - offset);
+        }
+        else
+        {
+            magnitude = std::ldexp(
+                static_cast<double>(mantissa),
+                exponent - maximum_offset - mantissa_bits);
+        }
+
+        const float result = static_cast<float>(magnitude);
+        return negative ? -result : result;
+    }
+
+    std::uint64_t readBits(const BitStream &stream, std::size_t &bit_offset, int bit_count)
+    {
+        const std::uint64_t value = stream.readBits(
+            bit_offset,
+            static_cast<std::size_t>(bit_count));
+
+        bit_offset += static_cast<std::size_t>(bit_count);
+        return value;
     }
 
 }
 
 AFPQuantizer::AFPQuantizer(AFPConfig config) : config_(config)
 {
-    if (config_.block_size == 0)
-    {
-        throw std::invalid_argument("block_size must be greater than zero");
-    }
-
-    if (config_.offset_bits <= 0 || config_.offset_bits >= 63)
-    {
-        throw std::invalid_argument("offset_bits must be between 1 and 62");
-    }
-
-    if (config_.mantissa_bits <= 0 || config_.mantissa_bits >= 63)
-    {
-        throw std::invalid_argument("mantissa_bits must be between 1 and 62");
-    }
-
-    if (config_.exponent_bits <= 1 || config_.exponent_bits > 63)
-    {
-        throw std::invalid_argument("Invalid exponent_bits");
-    }
+    validateConfig(config_);
 }
 
 AFPEncodedTensor AFPQuantizer::encode(const std::vector<float> &input) const
@@ -79,138 +250,177 @@ AFPEncodedTensor AFPQuantizer::encode(const std::vector<float> &input) const
     AFPEncodedTensor encoded;
 
     encoded.config_ = config_;
-
     encoded.value_count_ = input.size();
 
-    const std::uint64_t max_offset = (std::uint64_t{1} << config_.offset_bits) - 1;
+    if (input.empty())
+        return encoded;
 
-    const std::uint64_t max_mantissa = (std::uint64_t{1} << config_.mantissa_bits) - 1;
-
-    for (std::size_t block_start = 0; block_start < input.size(); block_start += config_.block_size)
+    for (std::size_t block_start = 0;
+         block_start < input.size();
+         block_start += block_size)
     {
-        const std::size_t block_end = std::min(block_start + config_.block_size, input.size());
         encoded.block_offsets_.push_back(encoded.bits_.bitSize());
 
-        int shared_exponent = 0;
-        bool has_nonzero = false;
-        for (std::size_t i = block_start; i < block_end; ++i)
+        std::vector<float> block(block_size, 0.0f);
+
+        for (std::size_t i = 0; i < block_size && block_start + i < input.size(); ++i)
         {
-            const float value = input[i];
+            const float value = input[block_start + i];
 
-            if (value == 0.0f)
-            {
-                continue;
-            }
+            if (!std::isfinite(value))
+                throw std::invalid_argument("AFP8 does not support NaN or infinity");
 
-            const int exponent = quantization_utils::getExponent(value);
-
-            if (!has_nonzero || exponent > shared_exponent)
-            {
-                shared_exponent = exponent;
-            }
-
-            has_nonzero = true;
+            block[i] = value;
         }
 
-        encoded.bits_.writeBits(encodeSigned(shared_exponent, config_.exponent_bits), config_.exponent_bits);
+        const int exponent = sharedExponent(block);
 
+        const bool first_half_positive =
+            halfIsPositive(block, 0, half_block_size);
 
-        for (std::size_t i = block_start; i < block_end; ++i)
+        const bool second_half_positive =
+            halfIsPositive(block, half_block_size, block_size);
+
+        std::uint8_t characterization = 0;
+
+        if (first_half_positive)
+            characterization |= std::uint8_t{1} << first_half_positive_bit;
+
+        if (second_half_positive)
+            characterization |= std::uint8_t{1} << second_half_positive_bit;
+
+        encoded.bits_.writeBits(encodeSharedExponent(exponent), 8);
+        encoded.bits_.writeBits(characterization, 8);
+
+        for (std::size_t i = 0; i < block_size; ++i)
         {
-            const float value = input[i];
+            const float value = block[i];
+            const bool positive_half =
+                i < half_block_size ? first_half_positive : second_half_positive;
 
-            if (value == 0.0f)
+            const int effective_mantissa_bits =
+                config_.mantissa_bits + (positive_half ? 1 : 0);
+
+            const bool negative = std::signbit(value) && value != 0.0f;
+
+            int offset = maximum_offset;
+            std::uint64_t mantissa = 0;
+
+            if (value != 0.0f)
             {
-                encoded.bits_.writeBits(0, 1);
-                encoded.bits_.writeBits(max_offset, config_.offset_bits);
-                encoded.bits_.writeBits(0, config_.mantissa_bits);
-                continue;
+                const int value_exponent = unbiasedExponent(std::fabs(value));
+                const int true_offset = exponent - value_exponent;
+
+                // offset = std::clamp(true_offset, 0, maximum_offset);
+                if (true_offset < 0) {
+                    offset = 0;
+                }
+                else if (true_offset > maximum_offset) {
+                    offset = maximum_offset;
+                }
+                else {
+                    offset = true_offset;
+                }
+
+                mantissa = encodeMantissa(
+                    std::fabs(value),
+                    exponent,
+                    offset,
+                    effective_mantissa_bits);
             }
 
-            const std::uint64_t sign = value < 0.0f ? 1 : 0;
-            const int value_exponent = quantization_utils::getExponent(value);
-            int offset = shared_exponent - value_exponent;
-            offset = std::max(offset, 0);
-            offset = std::min(offset, static_cast<int>(max_offset));
+            if (positive_half)
+            {
+                const std::uint64_t extra_bit =
+                    mantissa >> config_.mantissa_bits;
 
-            const int effective_exponent = shared_exponent - offset;
+                const std::uint64_t stored_mantissa =
+                    mantissa & bitMask(config_.mantissa_bits);
 
-            const float scale = std::ldexp(1.0f, effective_exponent) / static_cast<float>(max_mantissa);
-
-            std::uint64_t mantissa = static_cast<std::uint64_t>(std::llround(std::abs(value) / scale));
-            mantissa = std::min(mantissa, max_mantissa);
-            encoded.bits_.writeBits(sign,1);
-
-            encoded.bits_.writeBits(static_cast<std::uint64_t>(offset), config_.offset_bits);
-
-            encoded.bits_.writeBits(mantissa, config_.mantissa_bits);
+                encoded.bits_.writeBits(extra_bit, 1);
+                encoded.bits_.writeBits(offset, 3);
+                encoded.bits_.writeBits(stored_mantissa, 5);
+            }
+            else
+            {
+                encoded.bits_.writeBits(negative ? 1 : 0, 1);
+                encoded.bits_.writeBits(offset, 3);
+                encoded.bits_.writeBits(mantissa, 5);
+            }
         }
     }
+
     return encoded;
 }
 
 std::vector<float> AFPQuantizer::decode(const AFPEncodedTensor &encoded) const
 {
-    std::vector<float> output;
+    validateConfig(encoded.config_);
 
+    std::vector<float> output;
     output.reserve(encoded.value_count_);
 
-    const AFPConfig &config = encoded.config_;
+    if (encoded.value_count_ == 0)
+        return output;
 
-    const std::uint64_t max_offset = (std::uint64_t{1} << config.offset_bits) - 1;
+    std::size_t bit_offset = 0;
+    std::size_t values_decoded = 0;
 
-    const std::uint64_t max_mantissa = (std::uint64_t{1} << config.mantissa_bits) - 1;
-
-    for (std::size_t block_index = 0; block_index < encoded.block_offsets_.size(); ++block_index)
+    while (values_decoded < encoded.value_count_)
     {
-        std::size_t bit_offset = encoded.block_offsets_[block_index];
+        const std::uint8_t stored_exponent =
+            static_cast<std::uint8_t>(readBits(encoded.bits_, bit_offset, 8));
 
-        const std::uint64_t raw_exponent = encoded.bits_.readBits(bit_offset, config.exponent_bits);
+        const int exponent = decodeSharedExponent(stored_exponent);
 
-        bit_offset += config.exponent_bits;
+        const std::uint8_t characterization =
+            static_cast<std::uint8_t>(readBits(encoded.bits_, bit_offset, 8));
 
-        const int shared_exponent = static_cast<int>(signExtend(raw_exponent, config.exponent_bits));
+        const bool first_half_positive =
+            (characterization & (std::uint8_t{1} << first_half_positive_bit)) != 0;
 
-        const std::size_t values_in_block = std::min(config.block_size, encoded.value_count_ - output.size());
+        const bool second_half_positive =
+            (characterization & (std::uint8_t{1} << second_half_positive_bit)) != 0;
 
-        for (std::size_t i = 0; i < values_in_block; ++i)
+        for (std::size_t i = 0; i < block_size; ++i)
         {
-            const bool negative = encoded.bits_.readBits(bit_offset, 1) != 0;
+            const bool positive_half =
+                i < half_block_size ? first_half_positive : second_half_positive;
 
-            bit_offset += 1;
+            const std::uint64_t first_field =
+                readBits(encoded.bits_, bit_offset, 1);
 
-            const std::uint64_t offset = encoded.bits_.readBits(bit_offset, config.offset_bits);
+            const int offset =
+                static_cast<int>(readBits(encoded.bits_, bit_offset, 3));
 
-            bit_offset += config.offset_bits;
+            std::uint64_t mantissa =
+                readBits(encoded.bits_, bit_offset, 5);
 
-            const std::uint64_t mantissa = encoded.bits_.readBits(bit_offset, config.mantissa_bits);
+            bool negative = false;
+            int effective_mantissa_bits = config_.mantissa_bits;
 
-            bit_offset += config.mantissa_bits;
-
-            if (mantissa == 0)
+            if (positive_half)
             {
-                output.push_back(0.0f);
-
-                continue;
+                mantissa |= first_field << config_.mantissa_bits;
+                effective_mantissa_bits++;
+            }
+            else
+            {
+                negative = first_field != 0;
             }
 
-            if (offset > max_offset)
+            if (values_decoded < encoded.value_count_)
             {
-                throw std::runtime_error("Invalid AFP exponent offset");
+                output.push_back(
+                    decodeValue(
+                        negative,
+                        exponent,
+                        offset,
+                        mantissa,
+                        effective_mantissa_bits));
+
+                ++values_decoded;
             }
-
-            const int effective_exponent = shared_exponent - static_cast<int>(offset);
-
-            const float scale = std::ldexp(1.0f, effective_exponent) / static_cast<float>(max_mantissa);
-
-            float value =static_cast<float>(mantissa) * scale;
-
-            if (negative)
-            {
-                value = -value;
-            }
-
-            output.push_back(value);
         }
     }
 
