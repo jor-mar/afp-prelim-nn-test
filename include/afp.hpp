@@ -20,6 +20,8 @@ struct AFPConfig
     bool enable_zero_fields = false;
 };
 
+class AFPArithmetic;
+
 class AFPEncodedTensor : public EncodedTensor
 {
 public:
@@ -70,6 +72,7 @@ public:
 
 private:
     friend class AFPQuantizer;
+    friend class AFPArithmetic;
 
     AFPConfig config_;
     std::vector<std::size_t> block_offsets_;
