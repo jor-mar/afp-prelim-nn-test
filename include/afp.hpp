@@ -69,6 +69,7 @@ public:
     {
         return block_offsets_.size();
     }
+    
 
 private:
     friend class AFPQuantizer;
