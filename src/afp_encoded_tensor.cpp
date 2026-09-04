@@ -1,4 +1,6 @@
-#include "../include/afp.hpp"
+#include "../include/afp_encoded_tensor.hpp"
+
+#include "../include/afp_math.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -239,6 +241,87 @@ namespace
     }
 
 }
+
+/*
+AFPEncodedTensor AFPEncodedTensor::operator*(
+    const AFPEncodedTensor &other
+) const
+{
+    return AFPArithmetic::multiply(
+        *this,
+        other
+    );
+}
+
+AFPEncodedTensor AFPEncodedTensor::operator+(
+    const AFPEncodedTensor &other
+) const
+{
+    return AFPArithmetic::add(
+        *this,
+        other
+    );
+}
+
+AFPEncodedTensor AFPEncodedTensor::operator-(
+    const AFPEncodedTensor &other
+) const
+{
+    return AFPArithmetic::subtract(
+        *this,
+        other
+    );
+}
+
+AFPEncodedTensor AFPEncodedTensor::operator-() const
+{
+    return AFPArithmetic::negate(*this);
+}
+
+AFPEncodedTensor AFPEncodedTensor::operator/(
+    const AFPEncodedTensor &other
+) const
+{
+    return AFPArithmetic::divide(
+        *this,
+        other
+    );
+}
+
+bool AFPEncodedTensor::operator==(
+    const AFPEncodedTensor &other
+) const
+{
+    if (value_count_ != other.value_count_)
+    {
+        return false;
+    }
+
+    if (config_.mantissa_bits != other.config_.mantissa_bits)
+    {
+        return false;
+    }
+
+    if (config_.block_size != other.config_.block_size)
+    {
+        return false;
+    }
+
+    if (bits_.bitSize() != other.bits_.bitSize())
+    {
+        return false;
+    }
+
+    return bits_.data() == other.bits_.data();
+}
+
+bool AFPEncodedTensor::operator!=(
+    const AFPEncodedTensor &other
+) const
+{
+    return !(*this == other);
+}
+*/
 
 AFPQuantizer::AFPQuantizer(AFPConfig config) : config_(config)
 {

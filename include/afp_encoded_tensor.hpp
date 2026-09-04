@@ -25,6 +25,7 @@ class AFPArithmetic;
 class AFPEncodedTensor : public EncodedTensor
 {
 public:
+
     std::string formatName() const override
     {
         return "AFP8";
@@ -69,7 +70,11 @@ public:
     {
         return block_offsets_.size();
     }
-    
+
+    const AFPConfig &config() const
+    {
+        return config_;
+    }
 
 private:
     friend class AFPQuantizer;

@@ -1,6 +1,5 @@
 #pragma once
-
-#include "afp.hpp"
+#include "afp_encoded_tensor.hpp"
 
 #include <cstddef>
 #include <cstdint>

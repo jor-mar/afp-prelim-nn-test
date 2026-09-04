@@ -1,5 +1,5 @@
 #include "../include/afp_math.hpp"
-#include "../include/afp.hpp"
+#include "../include/afp_encoded_tensor.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -1497,7 +1497,7 @@ AFPEncodedTensor AFPArithmetic::sigmoid(const AFPEncodedTensor &input)
         const std::size_t position = index % block_size;
         AFPValue value = readAFPValue(input, block, position);
         const AFPProduct prod = normalizeToProduct(value);
-        if (value.zero) { output.push_back(makeConstant(-1, 0)); output.back().zero = true; continue; }
+        if (value.zero) { output.push_back(makeConstant(-1, 32)); continue; }
         if (prod.scale_exponent >= 2) {
             output.push_back(value.negative ? makeConstant(-1, 0) : makeConstant(0, 32));
             output.back().zero = value.negative;
@@ -2024,80 +2024,155 @@ AFPEncodedTensor AFPArithmetic::gelu(
 AFPArithmetic::AFPValue AFPArithmetic::expValue(
     const AFPValue &value)
 {
+    if (value.zero)
+        return oneValue();
+
     /*
-     * Approximate exp(x).
+     * exp(x) =
      *
-     * Range reduction:
+     * 1
+     * + x
+     * + x^2 / 2
+     * + x^3 / 6
+     * + x^4 / 24
+     * + x^5 / 120
+     * + x^6 / 720
      *
-     * exp(x) = 2^(x / ln(2))
-     *
-     * We use:
-     *
-     * 1/ln(2) ≈ 1.5
-     *
-     * which is intentionally AFP-friendly.
+     * This is accurate enough for the small range normally
+     * encountered by activation functions and softmax.
      */
 
     const AFPValue one = oneValue();
 
-    AFPValue three_halves;
-    three_halves.negative = false;
-    three_halves.exponent = 0;
-    three_halves.offset = 1;
-    three_halves.mantissa_bits = 5;
-    three_halves.mantissa =
-        (std::uint64_t{1} << 5) + 16;
-    three_halves.zero = false;
+    /*
+     * Constants.
+     *
+     * These are represented directly as AFP values.
+     *
+     * 1/2  = 0.5
+     * 1/6  ≈ 0.1667
+     * 1/24 ≈ 0.04167
+     * 1/120 ≈ 0.00833
+     * 1/720 ≈ 0.001389
+     */
 
-    const AFPValue y =
-        multiplyValues(value, three_halves);
+    AFPValue half;
+    half.negative = false;
+    half.exponent = -1;
+    half.offset = 0;
+    half.mantissa_bits = 5;
+    half.mantissa = 32;
+    half.zero = false;
 
-    const AFPProduct p =
-        normalizeToProduct(y);
+    AFPValue one_sixth;
+    one_sixth.negative = false;
+    one_sixth.exponent = -3;
+    one_sixth.offset = 0;
+    one_sixth.mantissa_bits = 5;
+    one_sixth.mantissa = 43;
+    one_sixth.zero = false;
 
-    const int exponent =
-        p.scale_exponent +
-        integerLog2(p.significand);
+    AFPValue one_twenty_fourth;
+    one_twenty_fourth.negative = false;
+    one_twenty_fourth.exponent = -5;
+    one_twenty_fourth.offset = 0;
+    one_twenty_fourth.mantissa_bits = 5;
+    one_twenty_fourth.mantissa = 43;
+    one_twenty_fourth.zero = false;
+
+    AFPValue one_one_twentieth;
+    one_one_twentieth.negative = false;
+    one_one_twentieth.exponent = -7;
+    one_one_twentieth.offset = 0;
+    one_one_twentieth.mantissa_bits = 5;
+    one_one_twentieth.mantissa = 43;
+    one_one_twentieth.zero = false;
+
+    AFPValue one_seven_twentieth;
+    one_seven_twentieth.negative = false;
+    one_seven_twentieth.exponent = -9;
+    one_seven_twentieth.offset = 0;
+    one_seven_twentieth.mantissa_bits = 5;
+    one_seven_twentieth.mantissa = 45;
+    one_seven_twentieth.zero = false;
 
     /*
-     * Very rough saturation.
+     * x²
      */
-    if (exponent > 7)
-        return scalePowerOfTwo(one, 7);
-
-    if (exponent < -7)
-        return zeroValue();
+    const AFPValue x2 =
+        multiplyValues(value, value);
 
     /*
-     * Polynomial:
-     *
-     * 2^f ≈ 1 + f ln2 + f² ln²2 / 2
-     *
-     * using ln2 ≈ 0.5.
+     * x³
      */
-    const AFPValue half = halfValue();
+    const AFPValue x3 =
+        multiplyValues(x2, value);
 
-    const AFPValue y2 =
-        multiplyValues(y, y);
+    /*
+     * x⁴
+     */
+    const AFPValue x4 =
+        multiplyValues(x3, value);
 
-    const AFPValue quadratic =
-        multiplyValues(y2, half);
+    /*
+     * x⁵
+     */
+    const AFPValue x5 =
+        multiplyValues(x4, value);
 
-    const AFPValue linear =
-        multiplyValues(y, half);
+    /*
+     * x⁶
+     */
+    const AFPValue x6 =
+        multiplyValues(x5, value);
+
+    /*
+     * x² / 2
+     */
+    const AFPValue term2 =
+        multiplyValues(x2, half);
+
+    /*
+     * x³ / 6
+     */
+    const AFPValue term3 =
+        multiplyValues(x3, one_sixth);
+
+    /*
+     * x⁴ / 24
+     */
+    const AFPValue term4 =
+        multiplyValues(x4, one_twenty_fourth);
+
+    /*
+     * x⁵ / 120
+     */
+    const AFPValue term5 =
+        multiplyValues(x5, one_one_twentieth);
+
+    /*
+     * x⁶ / 720
+     */
+    const AFPValue term6 =
+        multiplyValues(x6, one_seven_twentieth);
 
     AFPValue result =
-        addValues(one, linear);
+        addValues(one, value);
 
     result =
-        addValues(result, quadratic);
+        addValues(result, term2);
 
-    /*
-     * Apply coarse power-of-two scaling.
-     */
-    if (exponent != 0)
-        result =
-            scalePowerOfTwo(result, exponent);
+    result =
+        addValues(result, term3);
+
+    result =
+        addValues(result, term4);
+
+    result =
+        addValues(result, term5);
+
+    result =
+        addValues(result, term6);
 
     return result;
 }
@@ -2115,6 +2190,100 @@ AFPEncodedTensor AFPArithmetic::exp(
 
         output.push_back(
             expValue(value)
+        );
+    }
+
+    return buildTensorFromAFPValues(
+        output,
+        input.config_
+    );
+}
+
+AFPEncodedTensor AFPArithmetic::softmax(
+    const AFPEncodedTensor &input)
+{
+    if (input.size() == 0)
+        return input;
+
+    /*
+     * Find maximum.
+     */
+    AFPValue maximum_value =
+        readAFPValue(input, 0, 0);
+
+    for (std::size_t i = 1; i < input.size(); ++i)
+    {
+        const AFPValue value =
+            readAFPValue(input, i / block_size, i % block_size);
+
+        if (compareAFPValues(value, maximum_value) > 0)
+            maximum_value = value;
+    }
+
+    /*
+     * Compute exponentials after subtracting maximum.
+     */
+    std::vector<AFPValue> exponentials;
+    exponentials.reserve(input.size());
+
+    AFPAccumulator denominator;
+
+    for (std::size_t i = 0; i < input.size(); ++i)
+    {
+        const AFPValue value =
+            readAFPValue(input, i / block_size, i % block_size);
+
+        const AFPValue shifted =
+            subtractValues(value, maximum_value);
+
+        const AFPValue e =
+            expValue(shifted);
+
+        exponentials.push_back(e);
+
+        const AFPProduct product =
+            normalizeToProduct(e);
+
+        denominator =
+            addProducts(denominator, product);
+    }
+
+    if (denominator.zero)
+    {
+        return buildTensorFromAFPValues(
+            std::vector<AFPValue>(
+                input.size(),
+                zeroValue()
+            ),
+            input.config_
+        );
+    }
+
+    const int denominator_exponent =
+        denominator.exponent +
+        integerLog2(
+            static_cast<std::uint64_t>(
+                denominator.significand
+            )
+        );
+
+    const AFPValue denominator_value =
+        accumulatorToAFPValue(
+            denominator,
+            denominator_exponent,
+            false
+        );
+
+    /*
+     * Normalize each exponential.
+     */
+    std::vector<AFPValue> output;
+    output.reserve(input.size());
+
+    for (const AFPValue &e : exponentials)
+    {
+        output.push_back(
+            divideValues(e, denominator_value)
         );
     }
 
