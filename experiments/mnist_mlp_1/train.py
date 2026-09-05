@@ -160,12 +160,6 @@ def main():
             f"Test Acc: {test_accuracy:.2f}%"
         )
 
-    """
-    torch.save(
-        model.state_dict(),
-        "mnist_mlp.pth"
-    )
-    """
     torch.save(
         model.state_dict(),
         SCRIPT_DIR / "mnist_mlp.pth"
