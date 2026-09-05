@@ -15,6 +15,75 @@ constexpr int AFPArithmetic::maximum_offset;
 constexpr int AFPArithmetic::fp32_exponent_bias;
 
 // ============================================================================
+// Internal AFP Value Helpers
+// ============================================================================
+
+/*
+namespace
+{
+    bool isZeroAFPValue(const AFPArithmetic::AFPValue &value)
+    {
+        return value.offset == AFPArithmetic::maximum_offset &&
+               value.mantissa == 0;
+    }
+
+    int mantissaBitsForValue(const AFPArithmetic::AFPValue &value)
+    {
+        /*
+         * Normal fields have an implicit leading 1.
+         *
+         * 5-bit mantissa:
+         *     implicit + 5 stored bits
+         *     => mantissa range 32..63
+         *
+         * Positive fields reclaim the sign bit and therefore have
+         * a 6-bit mantissa.
+         *
+         * 6-bit mantissa:
+         *     implicit + 6 stored bits
+         *     => mantissa range 64..127
+         *
+         * For offset == 7 there is no implicit leading 1:
+         *
+         *     5-bit field => 0..31
+         *     6-bit field => 0..63
+         *
+         * Therefore values >= 32 at offset 7 must have come from
+         * a positive 6-bit field.
+         //
+        if (value.offset < AFPArithmetic::maximum_offset)
+        {
+            return value.mantissa >= 64 ? 6 : 5;
+        }
+
+        return value.mantissa >= 32 ? 6 : 5;
+    }
+}
+*/
+
+bool AFPArithmetic::isZeroAFPValue(const AFPValue &value)
+{
+    return value.offset == maximum_offset &&
+           value.mantissa == 0;
+}
+
+int AFPArithmetic::mantissaBitsForValue(const AFPValue &value)
+{
+    if (value.offset < maximum_offset)
+    {
+        if (value.mantissa >= 64)
+            return 6;
+
+        return 5;
+    }
+
+    if (value.mantissa >= 32)
+        return 6;
+
+    return 5;
+}
+
+// ============================================================================
 // Utility Functions
 // ============================================================================
 
@@ -22,34 +91,46 @@ int AFPArithmetic::integerLog2(std::uint64_t value)
 {
     if (value == 0)
         return -1;
-    
+
     int result = -1;
+
     while (value != 0)
     {
         value >>= 1;
         ++result;
     }
+
     return result;
 }
 
-std::uint64_t AFPArithmetic::shiftRightRounded(std::uint64_t value, int shift)
+std::uint64_t AFPArithmetic::shiftRightRounded(
+    std::uint64_t value,
+    int shift)
 {
     if (shift <= 0)
         return value;
-    
+
     if (shift >= 64)
         return 0;
-    
-    const std::uint64_t truncated = value >> shift;
-    const std::uint64_t remainder = value & maskBits(shift);
-    const std::uint64_t halfway = std::uint64_t{1} << (shift - 1);
-    
+
+    const std::uint64_t truncated =
+        value >> shift;
+
+    const std::uint64_t remainder =
+        value & maskBits(shift);
+
+    const std::uint64_t halfway =
+        std::uint64_t{1} << (shift - 1);
+
     if (remainder > halfway)
         return truncated + 1;
-    
-    if (remainder == halfway && (truncated & 1U))
+
+    if (remainder == halfway &&
+        (truncated & 1U))
+    {
         return truncated + 1;
-    
+    }
+
     return truncated;
 }
 
@@ -57,29 +138,35 @@ std::uint64_t AFPArithmetic::maskBits(int bit_count)
 {
     if (bit_count <= 0)
         return 0;
-    
+
     if (bit_count >= 64)
         return std::numeric_limits<std::uint64_t>::max();
-    
+
     return (std::uint64_t{1} << bit_count) - 1;
 }
 
-int AFPArithmetic::decodeSharedExponent(std::uint8_t encoded)
+int AFPArithmetic::decodeSharedExponent(
+    std::uint8_t encoded)
 {
     if (encoded == 0)
         return -126;
-    
-    return static_cast<int>(encoded) - fp32_exponent_bias;
+
+    return static_cast<int>(encoded) -
+           fp32_exponent_bias;
 }
 
-std::uint8_t AFPArithmetic::encodeSharedExponent(int exponent)
+std::uint8_t AFPArithmetic::encodeSharedExponent(
+    int exponent)
 {
     if (exponent < -126)
         exponent = -126;
+
     if (exponent > 127)
         exponent = 127;
-    
-    return static_cast<std::uint8_t>(exponent + fp32_exponent_bias);
+
+    return static_cast<std::uint8_t>(
+        exponent + fp32_exponent_bias
+    );
 }
 
 void AFPArithmetic::validateCompatible(
@@ -87,10 +174,12 @@ void AFPArithmetic::validateCompatible(
     const AFPEncodedTensor &b)
 {
     if (a.size() != b.size())
-        throw std::invalid_argument("AFP tensor size mismatch");
-    
+        throw std::invalid_argument(
+            "AFP tensor size mismatch");
+
     if (a.config_.block_size != b.config_.block_size)
-        throw std::invalid_argument("AFP block size mismatch");
+        throw std::invalid_argument(
+            "AFP block size mismatch");
 }
 
 void AFPArithmetic::normalizeAccumulator(
@@ -146,55 +235,103 @@ AFPArithmetic::AFPValue AFPArithmetic::readAFPValue(
     constexpr std::size_t characterization_bits = 8;
     constexpr std::size_t first_field_bits = 1;
     constexpr std::size_t offset_bits = 3;
-    constexpr std::size_t mantissa_bits = 5;
-    
-    constexpr std::size_t block_header_bits = shared_exponent_bits + characterization_bits;
-    constexpr std::size_t value_bits = first_field_bits + offset_bits + mantissa_bits;
-    
+    constexpr std::size_t stored_mantissa_bits = 5;
+
+    constexpr std::size_t block_header_bits =
+        shared_exponent_bits +
+        characterization_bits;
+
+    constexpr std::size_t value_bits =
+        first_field_bits +
+        offset_bits +
+        stored_mantissa_bits;
+
     constexpr std::uint8_t first_half_positive_bit = 0;
     constexpr std::uint8_t second_half_positive_bit = 1;
-    
-    const std::size_t block_base = tensor.block_offsets_[block_index];
-    
-    // Read shared exponent
-    const std::uint8_t exponent_field = static_cast<std::uint8_t>(
-        tensor.bits_.readBits(block_base, shared_exponent_bits));
-    const int exponent = decodeSharedExponent(exponent_field);
-    
-    // Read characterization
-    const std::uint8_t characterization = static_cast<std::uint8_t>(
-        tensor.bits_.readBits(block_base + shared_exponent_bits, characterization_bits));
-    
-    // Determine if this is a positive half
-    const bool is_first_half = value_index < half_block_size;
-    const bool positive_half = is_first_half ?
-        (characterization & (std::uint8_t{1} << first_half_positive_bit)) != 0 :
-        (characterization & (std::uint8_t{1} << second_half_positive_bit)) != 0;
-    
-    // Read value fields
-    const std::size_t value_base = block_base + block_header_bits + value_index * value_bits;
-    
-    const std::uint8_t first_field = static_cast<std::uint8_t>(
-        tensor.bits_.readBits(value_base, first_field_bits));
-    const std::uint8_t offset = static_cast<std::uint8_t>(
-        tensor.bits_.readBits(value_base + first_field_bits, offset_bits));
-    std::uint8_t mantissa = static_cast<std::uint8_t>(
-        tensor.bits_.readBits(value_base + first_field_bits + offset_bits, mantissa_bits));
-    
+
+    const std::size_t block_base =
+        tensor.block_offsets_[block_index];
+
+    const std::uint8_t exponent_field =
+        static_cast<std::uint8_t>(
+            tensor.bits_.readBits(
+                block_base,
+                shared_exponent_bits));
+
+    const int exponent =
+        decodeSharedExponent(exponent_field);
+
+    const std::uint8_t characterization =
+        static_cast<std::uint8_t>(
+            tensor.bits_.readBits(
+                block_base + shared_exponent_bits,
+                characterization_bits));
+
+    const bool is_first_half =
+        value_index < half_block_size;
+
+    const bool positive_half =
+        is_first_half ?
+            (characterization &
+             (std::uint8_t{1} <<
+              first_half_positive_bit)) != 0 :
+            (characterization &
+             (std::uint8_t{1} <<
+              second_half_positive_bit)) != 0;
+
+    const std::size_t value_base =
+        block_base +
+        block_header_bits +
+        value_index * value_bits;
+
+    const std::uint8_t first_field =
+        static_cast<std::uint8_t>(
+            tensor.bits_.readBits(
+                value_base,
+                first_field_bits));
+
+    const std::uint8_t offset =
+        static_cast<std::uint8_t>(
+            tensor.bits_.readBits(
+                value_base + first_field_bits,
+                offset_bits));
+
+    std::uint8_t mantissa =
+        static_cast<std::uint8_t>(
+            tensor.bits_.readBits(
+                value_base +
+                    first_field_bits +
+                    offset_bits,
+                stored_mantissa_bits));
+
     AFPValue result;
-    result.exponent = exponent;
-    result.offset = static_cast<int>(offset);
-    
+
+    result.exponent =
+        static_cast<std::int8_t>(exponent);
+
+    result.offset = offset;
+
     if (positive_half)
     {
-        // Positive field: first bit is extra mantissa bit
-        mantissa |= static_cast<std::uint8_t>(first_field << mantissa_bits);
+        /*
+         * Positive field:
+         *
+         * The first field bit is reclaimed as
+         * the sixth mantissa bit.
+         */
+        mantissa |= static_cast<std::uint8_t>(
+            first_field << stored_mantissa_bits);
+
         result.negative = false;
-        result.mantissa_bits = mantissa_bits + 1;
-        
+
+        const int value_mantissa_bits = 6;
+
         if (result.offset < maximum_offset)
         {
-            result.mantissa = (std::uint64_t{1} << result.mantissa_bits) + mantissa;
+            result.mantissa =
+                (std::uint64_t{1} <<
+                 value_mantissa_bits) +
+                mantissa;
         }
         else
         {
@@ -203,24 +340,32 @@ AFPArithmetic::AFPValue AFPArithmetic::readAFPValue(
     }
     else
     {
-        // Normal field: first bit is sign
-        result.negative = (first_field != 0);
-        result.mantissa_bits = mantissa_bits;
-        
+        /*
+         * Normal field:
+         *
+         * The first field bit is the sign.
+         */
+        result.negative =
+            first_field != 0;
+
+        const int value_mantissa_bits = 5;
+
         if (result.offset < maximum_offset)
         {
-            result.mantissa = (std::uint64_t{1} << result.mantissa_bits) + mantissa;
+            result.mantissa =
+                (std::uint64_t{1} <<
+                 value_mantissa_bits) +
+                mantissa;
         }
         else
         {
             result.mantissa = mantissa;
         }
     }
-    
-    result.zero = (result.offset == maximum_offset && result.mantissa == 0);
-    if (result.zero)
+
+    if (isZeroAFPValue(result))
         result.negative = false;
-    
+
     return result;
 }
 
@@ -229,37 +374,70 @@ void AFPArithmetic::writeAFPValue(
     const AFPValue &value,
     bool positive_field)
 {
-    constexpr std::size_t mantissa_bits = 5;
-    
+    constexpr std::size_t stored_mantissa_bits = 5;
+
+    /*
+     * The representation width belongs to the field,
+     * not to AFPValue itself.
+     */
+    const int value_mantissa_bits =
+        positive_field ? 6 : 5;
+
     std::uint64_t mantissa = 0;
-    
+
     if (value.offset < maximum_offset)
     {
-        const std::uint64_t implicit = std::uint64_t{1} << value.mantissa_bits;
+        const std::uint64_t implicit =
+            std::uint64_t{1} <<
+            value_mantissa_bits;
+
         if (value.mantissa >= implicit)
         {
-            mantissa = value.mantissa - implicit;
+            mantissa =
+                value.mantissa -
+                implicit;
         }
     }
     else
     {
         mantissa = value.mantissa;
     }
-    
+
     if (positive_field)
     {
-        const std::uint64_t extra_bit = mantissa >> mantissa_bits;
-        const std::uint64_t stored_mantissa = mantissa & maskBits(mantissa_bits);
-        
+        const std::uint64_t extra_bit =
+            mantissa >> stored_mantissa_bits;
+
+        const std::uint64_t stored_mantissa =
+            mantissa &
+            maskBits(stored_mantissa_bits);
+
         bits.writeBits(extra_bit, 1);
-        bits.writeBits(static_cast<std::uint64_t>(value.offset), 3);
-        bits.writeBits(stored_mantissa, 5);
+
+        bits.writeBits(
+            static_cast<std::uint64_t>(
+                value.offset),
+            3);
+
+        bits.writeBits(
+            stored_mantissa,
+            stored_mantissa_bits);
     }
     else
     {
-        bits.writeBits(value.negative ? 1 : 0, 1);
-        bits.writeBits(static_cast<std::uint64_t>(value.offset), 3);
-        bits.writeBits(mantissa & maskBits(mantissa_bits), 5);
+        bits.writeBits(
+            value.negative ? 1 : 0,
+            1);
+
+        bits.writeBits(
+            static_cast<std::uint64_t>(
+                value.offset),
+            3);
+
+        bits.writeBits(
+            mantissa &
+                maskBits(stored_mantissa_bits),
+            stored_mantissa_bits);
     }
 }
 
@@ -267,18 +445,30 @@ void AFPArithmetic::writeAFPValue(
 // AFP-Normal Arithmetic Operations
 // ============================================================================
 
-AFPArithmetic::AFPProduct AFPArithmetic::normalizeToProduct(const AFPValue &value)
+AFPArithmetic::AFPProduct AFPArithmetic::normalizeToProduct(
+    const AFPValue &value)
 {
     AFPProduct result;
-    
-    if (value.zero)
+
+    if (isZeroAFPValue(value))
         return result;
-    
-    result.negative = value.negative;
-    result.significand = value.mantissa;
-    result.scale_exponent = value.exponent - value.offset - value.mantissa_bits;
+
+    result.negative =
+        value.negative;
+
+    result.significand =
+        value.mantissa;
+
+    const int mantissa_bits =
+        mantissaBitsForValue(value);
+
+    result.scale_exponent =
+        static_cast<int>(value.exponent) -
+        static_cast<int>(value.offset) -
+        mantissa_bits;
+
     result.zero = false;
-    
+
     return result;
 }
 
@@ -287,21 +477,37 @@ AFPArithmetic::AFPProduct AFPArithmetic::multiplyAFPValues(
     const AFPValue &b)
 {
     AFPProduct result;
-    
-    if (a.zero || b.zero)
+
+    if (isZeroAFPValue(a) ||
+        isZeroAFPValue(b))
+    {
         return result;
-    
-    const AFPProduct norm_a = normalizeToProduct(a);
-    const AFPProduct norm_b = normalizeToProduct(b);
-    
-    result.negative = norm_a.negative ^ norm_b.negative;
-    result.significand = norm_a.significand * norm_b.significand;
-    result.scale_exponent = norm_a.scale_exponent + norm_b.scale_exponent;
-    result.zero = (result.significand == 0);
-    
+    }
+
+    const AFPProduct norm_a =
+        normalizeToProduct(a);
+
+    const AFPProduct norm_b =
+        normalizeToProduct(b);
+
+    result.negative =
+        norm_a.negative ^
+        norm_b.negative;
+
+    result.significand =
+        norm_a.significand *
+        norm_b.significand;
+
+    result.scale_exponent =
+        norm_a.scale_exponent +
+        norm_b.scale_exponent;
+
+    result.zero =
+        result.significand == 0;
+
     if (result.zero)
         result.negative = false;
-    
+
     return result;
 }
 
@@ -311,13 +517,13 @@ AFPArithmetic::AFPProduct AFPArithmetic::divideAFPValues(
 {
     AFPProduct result;
 
-    if (a.zero)
+    if (isZeroAFPValue(a))
     {
         result.zero = true;
         return result;
     }
 
-    if (b.zero)
+    if (isZeroAFPValue(b))
     {
         throw std::invalid_argument(
             "AFP division by zero");
@@ -346,19 +552,6 @@ AFPArithmetic::AFPProduct AFPArithmetic::divideAFPValues(
         numerator.negative ^
         denominator.negative;
 
-    /*
-     * Keep extra quotient precision.
-     *
-     * Instead of:
-     *
-     * numerator / denominator
-     *
-     * calculate:
-     *
-     * (numerator << division_precision_bits)
-     * --------------------------------------
-     * denominator
-     */
     constexpr int division_precision_bits = 24;
 
     const std::uint64_t numerator_significand =
@@ -387,9 +580,6 @@ AFPArithmetic::AFPProduct AFPArithmetic::divideAFPValues(
         scaled_numerator %
         denominator_significand;
 
-    /*
-     * Round to nearest, ties away from zero.
-     */
     std::uint64_t rounded_quotient =
         quotient;
 
@@ -399,8 +589,10 @@ AFPArithmetic::AFPProduct AFPArithmetic::divideAFPValues(
         if (rounded_quotient ==
             std::numeric_limits<std::uint64_t>::max())
         {
-            throw std::overflow_error("AFP division quotient overflow");
+            throw std::overflow_error(
+                "AFP division quotient overflow");
         }
+
         ++rounded_quotient;
     }
 
@@ -416,10 +608,6 @@ AFPArithmetic::AFPProduct AFPArithmetic::divideAFPValues(
 
     result.zero = false;
 
-    /*
-     * The significand gained
-     * division_precision_bits fractional bits.
-     */
     result.significand =
         rounded_quotient;
 
@@ -448,6 +636,7 @@ AFPArithmetic::AFPAccumulator AFPArithmetic::addProducts(
         result.significand == 0)
     {
         result.zero = false;
+
         result.negative =
             product.negative;
 
@@ -463,11 +652,6 @@ AFPArithmetic::AFPAccumulator AFPArithmetic::addProducts(
         return result;
     }
 
-    /*
-     * Represent both values using the smaller
-     * exponent so we preserve the smaller value's
-     * precision as much as possible.
-     */
     const int common_exponent =
         std::min(
             result.exponent,
@@ -488,9 +672,6 @@ AFPArithmetic::AFPAccumulator AFPArithmetic::addProducts(
         static_cast<std::int64_t>(
             product.significand);
 
-    /*
-     * Shift significands into the common exponent.
-     */
     if (accumulator_shift > 0)
     {
         if (accumulator_shift >= 63)
@@ -517,9 +698,6 @@ AFPArithmetic::AFPAccumulator AFPArithmetic::addProducts(
         }
     }
 
-    /*
-     * Apply signs.
-     */
     if (result.negative)
     {
         accumulator_value =
@@ -532,9 +710,6 @@ AFPArithmetic::AFPAccumulator AFPArithmetic::addProducts(
             -product_value;
     }
 
-    /*
-     * Add at the common scale.
-     */
     const std::int64_t sum =
         accumulator_value +
         product_value;
@@ -581,13 +756,24 @@ AFPArithmetic::AFPAccumulator AFPArithmetic::addAFPValues(
     const AFPValue &a,
     const AFPValue &b)
 {
-    const AFPProduct prod_a = normalizeToProduct(a);
-    const AFPProduct prod_b = normalizeToProduct(b);
-    
+    const AFPProduct prod_a =
+        normalizeToProduct(a);
+
+    const AFPProduct prod_b =
+        normalizeToProduct(b);
+
     AFPAccumulator result;
-    result = addProducts(result, prod_a);
-    result = addProducts(result, prod_b);
-    
+
+    result =
+        addProducts(
+            result,
+            prod_a);
+
+    result =
+        addProducts(
+            result,
+            prod_b);
+
     return result;
 }
 
@@ -596,9 +782,14 @@ AFPArithmetic::AFPAccumulator AFPArithmetic::subtractAFPValues(
     const AFPValue &b)
 {
     AFPValue neg_b = b;
-    neg_b.negative = !neg_b.negative;
-    
-    return addAFPValues(a, neg_b);
+
+    if (!isZeroAFPValue(neg_b))
+        neg_b.negative =
+            !neg_b.negative;
+
+    return addAFPValues(
+        a,
+        neg_b);
 }
 
 // ============================================================================
@@ -611,66 +802,126 @@ AFPArithmetic::AFPValue AFPArithmetic::accumulatorToAFPValue(
     bool positive_field)
 {
     AFPValue result;
-    result.exponent = shared_exponent;
-    result.negative = acc.negative;
-    result.mantissa_bits = positive_field ? 6 : 5;
-    
-    if (acc.zero || acc.significand == 0)
+
+    result.exponent =
+        static_cast<std::int8_t>(
+            shared_exponent);
+
+    result.negative =
+        acc.negative;
+
+    const int mantissa_bits =
+        positive_field ? 6 : 5;
+
+    if (acc.zero ||
+        acc.significand == 0)
     {
-        result.zero = true;
         result.negative = false;
-        result.offset = maximum_offset;
+        result.offset =
+            maximum_offset;
         result.mantissa = 0;
+
         return result;
     }
-    
-    const int highest_bit = integerLog2(static_cast<std::uint64_t>(acc.significand));
-    const int value_exponent = acc.exponent + highest_bit;
-    
-    int offset = shared_exponent - value_exponent;
-    offset = std::max(0, std::min(offset, maximum_offset));
-    result.offset = offset;
-    
-    const int target_exponent = shared_exponent - offset - result.mantissa_bits;
-    const int shift = target_exponent - acc.exponent;
-    
+
+    const int highest_bit =
+        integerLog2(
+            static_cast<std::uint64_t>(
+                acc.significand));
+
+    const int value_exponent =
+        acc.exponent +
+        highest_bit;
+
+    int offset =
+        shared_exponent -
+        value_exponent;
+
+    if (offset < 0)
+        offset = 0;
+
+    if (offset > maximum_offset)
+        offset = maximum_offset;
+
+    result.offset =
+        static_cast<std::uint8_t>(
+            offset);
+
+    const int target_exponent =
+        shared_exponent -
+        offset -
+        mantissa_bits;
+
+    const int shift =
+        target_exponent -
+        acc.exponent;
+
     std::uint64_t scaled;
+
     if (shift >= 0)
     {
         if (shift >= 64)
             scaled = 0;
         else
-            scaled = shiftRightRounded(static_cast<std::uint64_t>(acc.significand), shift);
+            scaled =
+                shiftRightRounded(
+                    static_cast<std::uint64_t>(
+                        acc.significand),
+                    shift);
     }
     else
     {
-        const int left_shift = -shift;
+        const int left_shift =
+            -shift;
+
         if (left_shift >= 63)
-            scaled = std::numeric_limits<std::uint64_t>::max();
+        {
+            scaled =
+                std::numeric_limits<
+                    std::uint64_t>::max();
+        }
         else
-            scaled = static_cast<std::uint64_t>(acc.significand) << left_shift;
+        {
+            scaled =
+                static_cast<std::uint64_t>(
+                    acc.significand)
+                << left_shift;
+        }
     }
-    
+
     if (offset < maximum_offset)
     {
-        const std::uint64_t implicit = std::uint64_t{1} << result.mantissa_bits;
-        const std::uint64_t maximum = (implicit << 1) - 1;
-        
-        if (scaled < implicit) scaled = implicit;
-        if (scaled > maximum) scaled = maximum;
-        
-        result.mantissa = scaled;
+        const std::uint64_t implicit =
+            std::uint64_t{1} <<
+            mantissa_bits;
+
+        const std::uint64_t maximum =
+            (implicit << 1) - 1;
+
+        if (scaled < implicit)
+            scaled = implicit;
+
+        if (scaled > maximum)
+            scaled = maximum;
+
+        result.mantissa =
+            scaled;
     }
     else
     {
-        const std::uint64_t maximum = maskBits(result.mantissa_bits);
-        if (scaled > maximum) scaled = maximum;
-        result.mantissa = scaled;
+        const std::uint64_t maximum =
+            maskBits(mantissa_bits);
+
+        if (scaled > maximum)
+            scaled = maximum;
+
+        result.mantissa =
+            scaled;
     }
-    
-    result.zero = (result.offset == maximum_offset && result.mantissa == 0);
-    if (result.zero) result.negative = false;
-    
+
+    if (isZeroAFPValue(result))
+        result.negative = false;
+
     return result;
 }
 
@@ -680,50 +931,71 @@ AFPArithmetic::AFPValue AFPArithmetic::productToAFPValue(
     bool positive_field)
 {
     AFPAccumulator acc;
-    acc.negative = prod.negative;
-    acc.significand = static_cast<std::int64_t>(prod.significand);
-    acc.exponent = prod.scale_exponent;
-    acc.zero = prod.zero;
-    
-    return accumulatorToAFPValue(acc, shared_exponent, positive_field);
+
+    acc.negative =
+        prod.negative;
+
+    acc.significand =
+        static_cast<std::int64_t>(
+            prod.significand);
+
+    acc.exponent =
+        prod.scale_exponent;
+
+    acc.zero =
+        prod.zero;
+
+    return accumulatorToAFPValue(
+        acc,
+        shared_exponent,
+        positive_field);
 }
 
 // ============================================================================
 // AFP Activation and Comparison Operations
 // ============================================================================
 
-bool AFPArithmetic::isAFPValueZero(const AFPValue &value)
+bool AFPArithmetic::isAFPValueZero(
+    const AFPValue &value)
 {
-    return value.zero;
+    return isZeroAFPValue(value);
 }
 
-bool AFPArithmetic::isAFPValueNegative(const AFPValue &value)
+bool AFPArithmetic::isAFPValueNegative(
+    const AFPValue &value)
 {
-    return value.negative && !value.zero;
+    return value.negative &&
+           !isZeroAFPValue(value);
 }
 
 int AFPArithmetic::compareAFPValues(
     const AFPValue &a,
     const AFPValue &b)
 {
-    if (a.zero && b.zero)
+    const bool a_zero =
+        isZeroAFPValue(a);
+
+    const bool b_zero =
+        isZeroAFPValue(b);
+
+    if (a_zero && b_zero)
         return 0;
 
-    if (a.zero)
+    if (a_zero)
         return b.negative ? 1 : -1;
 
-    if (b.zero)
+    if (b_zero)
         return a.negative ? -1 : 1;
 
     if (a.negative != b.negative)
         return a.negative ? -1 : 1;
 
-    const AFPProduct pa = normalizeToProduct(a);
-    const AFPProduct pb = normalizeToProduct(b);
+    const AFPProduct pa =
+        normalizeToProduct(a);
 
-    /*
-     * Compare magnitudes using the highest represented bit first.
-     */
+    const AFPProduct pb =
+        normalizeToProduct(b);
+
     const int a_top =
         pa.scale_exponent +
         integerLog2(pa.significand);
@@ -735,31 +1007,39 @@ int AFPArithmetic::compareAFPValues(
     int magnitude_comparison = 0;
 
     if (a_top < b_top)
-        magnitude_comparison = -1;
-    else if (a_top > b_top)
-        magnitude_comparison = 1;
-    else if (pa.scale_exponent == pb.scale_exponent)
     {
-        if (pa.significand < pb.significand)
+        magnitude_comparison = -1;
+    }
+    else if (a_top > b_top)
+    {
+        magnitude_comparison = 1;
+    }
+    else if (pa.scale_exponent ==
+             pb.scale_exponent)
+    {
+        if (pa.significand <
+            pb.significand)
+        {
             magnitude_comparison = -1;
-        else if (pa.significand > pb.significand)
+        }
+        else if (pa.significand >
+                 pb.significand)
+        {
             magnitude_comparison = 1;
+        }
     }
     else
     {
-        /*
-         * Same highest bit but different scales.
-         *
-         * Align the smaller significand conceptually. The
-         * difference is small because the highest bits match.
-         */
         const int shift =
-            pa.scale_exponent - pb.scale_exponent;
+            pa.scale_exponent -
+            pb.scale_exponent;
 
         if (shift > 0)
         {
             if (shift >= 64)
+            {
                 magnitude_comparison = 1;
+            }
             else
             {
                 const std::uint64_t lhs =
@@ -772,14 +1052,18 @@ int AFPArithmetic::compareAFPValues(
         }
         else
         {
-            const int reverse_shift = -shift;
+            const int reverse_shift =
+                -shift;
 
             if (reverse_shift >= 64)
+            {
                 magnitude_comparison = -1;
+            }
             else
             {
                 const std::uint64_t rhs =
-                    pb.significand << reverse_shift;
+                    pb.significand <<
+                    reverse_shift;
 
                 magnitude_comparison =
                     pa.significand < rhs ? -1 :
@@ -794,19 +1078,12 @@ int AFPArithmetic::compareAFPValues(
     return -magnitude_comparison;
 }
 
-AFPArithmetic::AFPValue AFPArithmetic::applyReLU(const AFPValue &value)
+AFPArithmetic::AFPValue AFPArithmetic::applyReLU(
+    const AFPValue &value)
 {
     if (isAFPValueNegative(value))
-    {
-        AFPValue zero_value;
-        zero_value.zero = true;
-        zero_value.offset = maximum_offset;
-        zero_value.mantissa = 0;
-        zero_value.mantissa_bits = 5;
-        zero_value.exponent = -126;
-        zero_value.negative = false;
-        return zero_value;
-    }
+        return zeroValue();
+
     return value;
 }
 
@@ -820,21 +1097,33 @@ int AFPArithmetic::computeSharedExponent(
 {
     int shared_exponent = -126;
     bool found_nonzero = false;
-    
-    for (std::size_t i = 0; i < block_size && block_start + i < values.size(); ++i)
+
+    for (std::size_t i = 0;
+         i < block_size &&
+         block_start + i < values.size();
+         ++i)
     {
-        const AFPValue &value = values[block_start + i];
-        if (value.zero)
+        const AFPValue &value =
+            values[block_start + i];
+
+        if (isZeroAFPValue(value))
             continue;
-        
-        const int effective_exponent = value.exponent - value.offset;
-        if (!found_nonzero || effective_exponent > shared_exponent)
+
+        const int effective_exponent =
+            static_cast<int>(value.exponent) -
+            static_cast<int>(value.offset);
+
+        if (!found_nonzero ||
+            effective_exponent >
+                shared_exponent)
         {
-            shared_exponent = effective_exponent;
+            shared_exponent =
+                effective_exponent;
+
             found_nonzero = true;
         }
     }
-    
+
     return shared_exponent;
 }
 
@@ -843,16 +1132,27 @@ bool AFPArithmetic::computeHalfPositive(
     std::size_t block_start,
     bool first_half)
 {
-    const std::size_t start = first_half ? 0 : half_block_size;
-    const std::size_t end = first_half ? half_block_size : block_size;
-    
-    for (std::size_t i = start; i < end && block_start + i < values.size(); ++i)
+    const std::size_t start =
+        first_half ? 0 : half_block_size;
+
+    const std::size_t end =
+        first_half ? half_block_size : block_size;
+
+    for (std::size_t i = start;
+         i < end &&
+         block_start + i < values.size();
+         ++i)
     {
-        const AFPValue &value = values[block_start + i];
-        if (!value.zero && value.negative)
+        const AFPValue &value =
+            values[block_start + i];
+
+        if (!isZeroAFPValue(value) &&
+            value.negative)
+        {
             return false;
+        }
     }
-    
+
     return true;
 }
 
@@ -862,13 +1162,23 @@ std::uint8_t AFPArithmetic::buildCharacterization(
 {
     constexpr std::uint8_t first_half_positive_bit = 0;
     constexpr std::uint8_t second_half_positive_bit = 1;
-    
+
     std::uint8_t characterization = 0;
+
     if (first_half_positive)
-        characterization |= (std::uint8_t{1} << first_half_positive_bit);
+    {
+        characterization |=
+            (std::uint8_t{1} <<
+             first_half_positive_bit);
+    }
+
     if (second_half_positive)
-        characterization |= (std::uint8_t{1} << second_half_positive_bit);
-    
+    {
+        characterization |=
+            (std::uint8_t{1} <<
+             second_half_positive_bit);
+    }
+
     return characterization;
 }
 
@@ -881,62 +1191,108 @@ AFPEncodedTensor AFPArithmetic::buildTensorFromAFPValues(
     const AFPConfig &config)
 {
     AFPEncodedTensor result;
+
     result.config_ = config;
     result.value_count_ = values.size();
-    
+
     if (values.empty())
         return result;
-    
-    for (std::size_t block_start = 0; block_start < values.size(); block_start += block_size)
+
+    for (std::size_t block_start = 0;
+         block_start < values.size();
+         block_start += block_size)
     {
-        result.block_offsets_.push_back(result.bits_.bitSize());
-        
-        // Compute shared exponent
-        const int shared_exponent = computeSharedExponent(values, block_start);
-        
-        // Compute half positivity
-        const bool first_half_positive = computeHalfPositive(values, block_start, true);
-        const bool second_half_positive = computeHalfPositive(values, block_start, false);
-        
-        // Build and write characterization
-        const std::uint8_t characterization = buildCharacterization(
-            first_half_positive, second_half_positive);
-        
-        result.bits_.writeBits(encodeSharedExponent(shared_exponent), 8);
-        result.bits_.writeBits(characterization, 8);
-        
-        // Write values
-        for (std::size_t i = 0; i < block_size; ++i)
+        result.block_offsets_.push_back(
+            result.bits_.bitSize());
+
+        const int shared_exponent =
+            computeSharedExponent(
+                values,
+                block_start);
+
+        const bool first_half_positive =
+            computeHalfPositive(
+                values,
+                block_start,
+                true);
+
+        const bool second_half_positive =
+            computeHalfPositive(
+                values,
+                block_start,
+                false);
+
+        const std::uint8_t characterization =
+            buildCharacterization(
+                first_half_positive,
+                second_half_positive);
+
+        result.bits_.writeBits(
+            encodeSharedExponent(
+                shared_exponent),
+            8);
+
+        result.bits_.writeBits(
+            characterization,
+            8);
+
+        for (std::size_t i = 0;
+             i < block_size;
+             ++i)
         {
-            const bool positive_field = (i < half_block_size) ? first_half_positive : second_half_positive;
-            
+            const bool positive_field =
+                i < half_block_size ?
+                    first_half_positive :
+                    second_half_positive;
+
             AFPValue value;
+
             if (block_start + i < values.size())
             {
-                // Re-quantize value to new shared exponent
-                const AFPProduct normalized = normalizeToProduct(values[block_start + i]);
+                const AFPProduct normalized =
+                    normalizeToProduct(
+                        values[block_start + i]);
+
                 AFPAccumulator acc;
-                acc.negative = normalized.negative;
-                acc.significand = static_cast<std::int64_t>(normalized.significand);
-                acc.exponent = normalized.scale_exponent;
-                acc.zero = normalized.zero;
-                
-                value = accumulatorToAFPValue(acc, shared_exponent, positive_field);
+
+                acc.negative =
+                    normalized.negative;
+
+                acc.significand =
+                    static_cast<std::int64_t>(
+                        normalized.significand);
+
+                acc.exponent =
+                    normalized.scale_exponent;
+
+                acc.zero =
+                    normalized.zero;
+
+                value =
+                    accumulatorToAFPValue(
+                        acc,
+                        shared_exponent,
+                        positive_field);
             }
             else
             {
-                value.zero = true;
+                value.exponent =
+                    static_cast<std::int8_t>(
+                        shared_exponent);
+
                 value.negative = false;
-                value.exponent = shared_exponent;
-                value.offset = maximum_offset;
+                value.offset =
+                    maximum_offset;
                 value.mantissa = 0;
-                value.mantissa_bits = positive_field ? 6 : 5;
             }
-            
-            writeAFPValue(result.bits_, value, positive_field);
+
+            writeAFPValue(
+                result.bits_,
+                value,
+                positive_field);
         }
     }
-    
+
     return result;
 }
 
@@ -949,27 +1305,55 @@ AFPEncodedTensor AFPArithmetic::add(
     const AFPEncodedTensor &b)
 {
     validateCompatible(a, b);
-    
+
     std::vector<AFPValue> output;
     output.reserve(a.size());
-    
-    for (std::size_t index = 0; index < a.size(); ++index)
+
+    for (std::size_t index = 0;
+         index < a.size();
+         ++index)
     {
-        const std::size_t block = index / block_size;
-        const std::size_t position = index % block_size;
-        
-        const AFPValue a_value = readAFPValue(a, block, position);
-        const AFPValue b_value = readAFPValue(b, block, position);
-        
-        const AFPAccumulator acc = addAFPValues(a_value, b_value);
-        
-        int temp_exponent = acc.zero ? -126 : acc.exponent + integerLog2(
-            static_cast<std::uint64_t>(acc.significand));
-        
-        output.push_back(accumulatorToAFPValue(acc, temp_exponent, false));
+        const std::size_t block =
+            index / block_size;
+
+        const std::size_t position =
+            index % block_size;
+
+        const AFPValue a_value =
+            readAFPValue(
+                a,
+                block,
+                position);
+
+        const AFPValue b_value =
+            readAFPValue(
+                b,
+                block,
+                position);
+
+        const AFPAccumulator acc =
+            addAFPValues(
+                a_value,
+                b_value);
+
+        int temp_exponent =
+            acc.zero ?
+                -126 :
+                acc.exponent +
+                integerLog2(
+                    static_cast<std::uint64_t>(
+                        acc.significand));
+
+        output.push_back(
+            accumulatorToAFPValue(
+                acc,
+                temp_exponent,
+                false));
     }
-    
-    return buildTensorFromAFPValues(output, a.config_);
+
+    return buildTensorFromAFPValues(
+        output,
+        a.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::subtract(
@@ -977,27 +1361,55 @@ AFPEncodedTensor AFPArithmetic::subtract(
     const AFPEncodedTensor &b)
 {
     validateCompatible(a, b);
-    
+
     std::vector<AFPValue> output;
     output.reserve(a.size());
-    
-    for (std::size_t index = 0; index < a.size(); ++index)
+
+    for (std::size_t index = 0;
+         index < a.size();
+         ++index)
     {
-        const std::size_t block = index / block_size;
-        const std::size_t position = index % block_size;
-        
-        const AFPValue a_value = readAFPValue(a, block, position);
-        const AFPValue b_value = readAFPValue(b, block, position);
-        
-        const AFPAccumulator acc = subtractAFPValues(a_value, b_value);
-        
-        int temp_exponent = acc.zero ? -126 : acc.exponent + integerLog2(
-            static_cast<std::uint64_t>(acc.significand));
-        
-        output.push_back(accumulatorToAFPValue(acc, temp_exponent, false));
+        const std::size_t block =
+            index / block_size;
+
+        const std::size_t position =
+            index % block_size;
+
+        const AFPValue a_value =
+            readAFPValue(
+                a,
+                block,
+                position);
+
+        const AFPValue b_value =
+            readAFPValue(
+                b,
+                block,
+                position);
+
+        const AFPAccumulator acc =
+            subtractAFPValues(
+                a_value,
+                b_value);
+
+        int temp_exponent =
+            acc.zero ?
+                -126 :
+                acc.exponent +
+                integerLog2(
+                    static_cast<std::uint64_t>(
+                        acc.significand));
+
+        output.push_back(
+            accumulatorToAFPValue(
+                acc,
+                temp_exponent,
+                false));
     }
-    
-    return buildTensorFromAFPValues(output, a.config_);
+
+    return buildTensorFromAFPValues(
+        output,
+        a.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::multiply(
@@ -1005,33 +1417,70 @@ AFPEncodedTensor AFPArithmetic::multiply(
     const AFPEncodedTensor &b)
 {
     validateCompatible(a, b);
-    
+
     std::vector<AFPValue> output;
     output.reserve(a.size());
-    
-    for (std::size_t index = 0; index < a.size(); ++index)
+
+    for (std::size_t index = 0;
+         index < a.size();
+         ++index)
     {
-        const std::size_t block = index / block_size;
-        const std::size_t position = index % block_size;
-        
-        const AFPValue a_value = readAFPValue(a, block, position);
-        const AFPValue b_value = readAFPValue(b, block, position);
-        
-        const AFPProduct product = multiplyAFPValues(a_value, b_value);
-        
+        const std::size_t block =
+            index / block_size;
+
+        const std::size_t position =
+            index % block_size;
+
+        const AFPValue a_value =
+            readAFPValue(
+                a,
+                block,
+                position);
+
+        const AFPValue b_value =
+            readAFPValue(
+                b,
+                block,
+                position);
+
+        const AFPProduct product =
+            multiplyAFPValues(
+                a_value,
+                b_value);
+
         AFPAccumulator acc;
-        acc.negative = product.negative;
-        acc.significand = static_cast<std::int64_t>(product.significand);
-        acc.exponent = product.scale_exponent;
-        acc.zero = product.zero;
-        
-        int temp_exponent = acc.zero ? -126 : acc.exponent + integerLog2(
-            static_cast<std::uint64_t>(acc.significand));
-        
-        output.push_back(accumulatorToAFPValue(acc, temp_exponent, false));
+
+        acc.negative =
+            product.negative;
+
+        acc.significand =
+            static_cast<std::int64_t>(
+                product.significand);
+
+        acc.exponent =
+            product.scale_exponent;
+
+        acc.zero =
+            product.zero;
+
+        int temp_exponent =
+            acc.zero ?
+                -126 :
+                acc.exponent +
+                integerLog2(
+                    static_cast<std::uint64_t>(
+                        acc.significand));
+
+        output.push_back(
+            accumulatorToAFPValue(
+                acc,
+                temp_exponent,
+                false));
     }
-    
-    return buildTensorFromAFPValues(output, a.config_);
+
+    return buildTensorFromAFPValues(
+        output,
+        a.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::divide(
@@ -1039,33 +1488,70 @@ AFPEncodedTensor AFPArithmetic::divide(
     const AFPEncodedTensor &b)
 {
     validateCompatible(a, b);
-    
+
     std::vector<AFPValue> output;
     output.reserve(a.size());
-    
-    for (std::size_t index = 0; index < a.size(); ++index)
+
+    for (std::size_t index = 0;
+         index < a.size();
+         ++index)
     {
-        const std::size_t block = index / block_size;
-        const std::size_t position = index % block_size;
-        
-        const AFPValue a_value = readAFPValue(a, block, position);
-        const AFPValue b_value = readAFPValue(b, block, position);
-        
-        const AFPProduct quotient = divideAFPValues(a_value, b_value);
-        
+        const std::size_t block =
+            index / block_size;
+
+        const std::size_t position =
+            index % block_size;
+
+        const AFPValue a_value =
+            readAFPValue(
+                a,
+                block,
+                position);
+
+        const AFPValue b_value =
+            readAFPValue(
+                b,
+                block,
+                position);
+
+        const AFPProduct quotient =
+            divideAFPValues(
+                a_value,
+                b_value);
+
         AFPAccumulator acc;
-        acc.negative = quotient.negative;
-        acc.significand = static_cast<std::int64_t>(quotient.significand);
-        acc.exponent = quotient.scale_exponent;
-        acc.zero = quotient.zero;
-        
-        int temp_exponent = acc.zero ? -126 : acc.exponent + integerLog2(
-            static_cast<std::uint64_t>(acc.significand));
-        
-        output.push_back(accumulatorToAFPValue(acc, temp_exponent, false));
+
+        acc.negative =
+            quotient.negative;
+
+        acc.significand =
+            static_cast<std::int64_t>(
+                quotient.significand);
+
+        acc.exponent =
+            quotient.scale_exponent;
+
+        acc.zero =
+            quotient.zero;
+
+        int temp_exponent =
+            acc.zero ?
+                -126 :
+                acc.exponent +
+                integerLog2(
+                    static_cast<std::uint64_t>(
+                        acc.significand));
+
+        output.push_back(
+            accumulatorToAFPValue(
+                acc,
+                temp_exponent,
+                false));
     }
-    
-    return buildTensorFromAFPValues(output, a.config_);
+
+    return buildTensorFromAFPValues(
+        output,
+        a.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::negate(
@@ -1074,21 +1560,26 @@ AFPEncodedTensor AFPArithmetic::negate(
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
-        if (!value.zero)
-            value.negative = !value.negative;
+        if (!isZeroAFPValue(value))
+            value.negative =
+                !value.negative;
 
         output.push_back(value);
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::absolute(
@@ -1097,10 +1588,15 @@ AFPEncodedTensor AFPArithmetic::absolute(
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         value.negative = false;
 
@@ -1109,8 +1605,7 @@ AFPEncodedTensor AFPArithmetic::absolute(
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::minimum(
@@ -1122,23 +1617,31 @@ AFPEncodedTensor AFPArithmetic::minimum(
     std::vector<AFPValue> output;
     output.reserve(a.size());
 
-    for (std::size_t i = 0; i < a.size(); ++i)
+    for (std::size_t i = 0;
+         i < a.size();
+         ++i)
     {
         const AFPValue av =
-            readAFPValue(a, i / block_size, i % block_size);
+            readAFPValue(
+                a,
+                i / block_size,
+                i % block_size);
 
         const AFPValue bv =
-            readAFPValue(b, i / block_size, i % block_size);
+            readAFPValue(
+                b,
+                i / block_size,
+                i % block_size);
 
         output.push_back(
-            compareAFPValues(av, bv) <= 0 ? av : bv
-        );
+            compareAFPValues(av, bv) <= 0 ?
+                av :
+                bv);
     }
 
     return buildTensorFromAFPValues(
         output,
-        a.config_
-    );
+        a.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::maximum(
@@ -1150,23 +1653,31 @@ AFPEncodedTensor AFPArithmetic::maximum(
     std::vector<AFPValue> output;
     output.reserve(a.size());
 
-    for (std::size_t i = 0; i < a.size(); ++i)
+    for (std::size_t i = 0;
+         i < a.size();
+         ++i)
     {
         const AFPValue av =
-            readAFPValue(a, i / block_size, i % block_size);
+            readAFPValue(
+                a,
+                i / block_size,
+                i % block_size);
 
         const AFPValue bv =
-            readAFPValue(b, i / block_size, i % block_size);
+            readAFPValue(
+                b,
+                i / block_size,
+                i % block_size);
 
         output.push_back(
-            compareAFPValues(av, bv) >= 0 ? av : bv
-        );
+            compareAFPValues(av, bv) >= 0 ?
+                av :
+                bv);
     }
 
     return buildTensorFromAFPValues(
         output,
-        a.config_
-    );
+        a.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::clamp(
@@ -1182,43 +1693,69 @@ AFPEncodedTensor AFPArithmetic::clamp(
         throw std::invalid_argument(
             "AFP clamp: max_value must contain one value");
 
-    if (input.config_.block_size != min_value.config_.block_size ||
-        input.config_.block_size != max_value.config_.block_size)
+    if (input.config_.block_size !=
+            min_value.config_.block_size ||
+        input.config_.block_size !=
+            max_value.config_.block_size)
     {
         throw std::invalid_argument(
             "AFP clamp: block size mismatch");
     }
 
     const AFPValue min_val =
-        readAFPValue(min_value, 0, 0);
+        readAFPValue(
+            min_value,
+            0,
+            0);
 
     const AFPValue max_val =
-        readAFPValue(max_value, 0, 0);
+        readAFPValue(
+            max_value,
+            0,
+            0);
 
-    if (compareAFPValues(min_val, max_val) > 0)
+    if (compareAFPValues(
+            min_val,
+            max_val) > 0)
+    {
         throw std::invalid_argument(
             "AFP clamp: min_value greater than max_value");
+    }
 
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
-        if (compareAFPValues(value, min_val) < 0)
+        if (compareAFPValues(
+                value,
+                min_val) < 0)
+        {
             output.push_back(min_val);
-        else if (compareAFPValues(value, max_val) > 0)
+        }
+        else if (compareAFPValues(
+                     value,
+                     max_val) > 0)
+        {
             output.push_back(max_val);
+        }
         else
+        {
             output.push_back(value);
+        }
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::leakyRelu(
@@ -1230,31 +1767,40 @@ AFPEncodedTensor AFPArithmetic::leakyRelu(
             "AFP leakyRelu: alpha must contain one value");
 
     const AFPValue alpha_value =
-        readAFPValue(alpha, 0, 0);
+        readAFPValue(
+            alpha,
+            0,
+            0);
 
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
-        if (value.zero || !value.negative)
+        if (isZeroAFPValue(value) ||
+            !value.negative)
         {
             output.push_back(value);
             continue;
         }
 
         output.push_back(
-            multiplyValues(value, alpha_value)
-        );
+            multiplyValues(
+                value,
+                alpha_value));
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::silu(
@@ -1265,8 +1811,7 @@ AFPEncodedTensor AFPArithmetic::silu(
 
     return multiply(
         input,
-        sigmoid_result
-    );
+        sigmoid_result);
 }
 
 // ============================================================================
@@ -1278,53 +1823,79 @@ AFPEncodedTensor AFPArithmetic::dotProduct(
     const AFPEncodedTensor &b)
 {
     validateCompatible(a, b);
-    
+
     if (a.size() == 0)
     {
         std::vector<AFPValue> zero_values(1);
-        zero_values[0].zero = true;
-        zero_values[0].offset = maximum_offset;
-        zero_values[0].mantissa = 0;
-        zero_values[0].mantissa_bits = 5;
-        zero_values[0].exponent = -126;
-        zero_values[0].negative = false;
-        return buildTensorFromAFPValues(zero_values, a.config_);
+
+        zero_values[0] =
+            zeroValue();
+
+        return buildTensorFromAFPValues(
+            zero_values,
+            a.config_);
     }
-    
+
     AFPAccumulator accumulator;
-    
-    for (std::size_t index = 0; index < a.size(); ++index)
+
+    for (std::size_t index = 0;
+         index < a.size();
+         ++index)
     {
-        const std::size_t block = index / block_size;
-        const std::size_t position = index % block_size;
-        
-        const AFPValue a_value = readAFPValue(a, block, position);
-        const AFPValue b_value = readAFPValue(b, block, position);
-        
-        const AFPProduct product = multiplyAFPValues(a_value, b_value);
-        accumulator = addProducts(accumulator, product);
+        const std::size_t block =
+            index / block_size;
+
+        const std::size_t position =
+            index % block_size;
+
+        const AFPValue a_value =
+            readAFPValue(
+                a,
+                block,
+                position);
+
+        const AFPValue b_value =
+            readAFPValue(
+                b,
+                block,
+                position);
+
+        const AFPProduct product =
+            multiplyAFPValues(
+                a_value,
+                b_value);
+
+        accumulator =
+            addProducts(
+                accumulator,
+                product);
     }
-    
+
     std::vector<AFPValue> result_values;
+
     if (accumulator.zero)
     {
-        AFPValue zero;
-        zero.zero = true;
-        zero.negative = false;
-        zero.offset = maximum_offset;
-        zero.mantissa = 0;
-        zero.mantissa_bits = 5;
-        zero.exponent = -126;
-        result_values.push_back(zero);
+        result_values.push_back(
+            zeroValue());
     }
     else
     {
-        const int exponent = accumulator.exponent + integerLog2(
-            static_cast<std::uint64_t>(accumulator.significand));
-        result_values.push_back(accumulatorToAFPValue(accumulator, exponent, false));
+        const int exponent =
+            accumulator.exponent +
+            integerLog2(
+                static_cast<std::uint64_t>(
+                    accumulator.significand));
+
+        result_values.push_back(
+            accumulatorToAFPValue(
+                accumulator,
+                exponent,
+                false));
     }
-    
-    return buildTensorFromAFPValues(result_values, a.config_);
+
+    return buildTensorFromAFPValues(
+        result_values,
+        a.config_);
 }
 
 // ============================================================================
@@ -1337,54 +1908,94 @@ AFPEncodedTensor AFPArithmetic::matrixVectorMultiply(
     std::size_t rows,
     std::size_t columns)
 {
-    if (weights.size() != rows * columns)
-        throw std::invalid_argument("Weight tensor size doesn't match dimensions");
+    if (weights.size() !=
+        rows * columns)
+    {
+        throw std::invalid_argument(
+            "Weight tensor size doesn't match dimensions");
+    }
+
     if (input.size() != columns)
-        throw std::invalid_argument("Input tensor size doesn't match columns");
-    
+    {
+        throw std::invalid_argument(
+            "Input tensor size doesn't match columns");
+    }
+
     std::vector<AFPValue> output;
     output.reserve(rows);
-    
-    for (std::size_t row = 0; row < rows; ++row)
+
+    for (std::size_t row = 0;
+         row < rows;
+         ++row)
     {
         AFPAccumulator row_accumulator;
-        
-        for (std::size_t col = 0; col < columns; ++col)
+
+        for (std::size_t col = 0;
+             col < columns;
+             ++col)
         {
-            const std::size_t weight_idx = row * columns + col;
-            
-            const std::size_t weight_block = weight_idx / block_size;
-            const std::size_t weight_pos = weight_idx % block_size;
-            const AFPValue weight_value = readAFPValue(weights, weight_block, weight_pos);
-            
-            const std::size_t input_block = col / block_size;
-            const std::size_t input_pos = col % block_size;
-            const AFPValue input_value = readAFPValue(input, input_block, input_pos);
-            
-            const AFPProduct product = multiplyAFPValues(weight_value, input_value);
-            row_accumulator = addProducts(row_accumulator, product);
+            const std::size_t weight_idx =
+                row * columns + col;
+
+            const std::size_t weight_block =
+                weight_idx / block_size;
+
+            const std::size_t weight_pos =
+                weight_idx % block_size;
+
+            const AFPValue weight_value =
+                readAFPValue(
+                    weights,
+                    weight_block,
+                    weight_pos);
+
+            const std::size_t input_block =
+                col / block_size;
+
+            const std::size_t input_pos =
+                col % block_size;
+
+            const AFPValue input_value =
+                readAFPValue(
+                    input,
+                    input_block,
+                    input_pos);
+
+            const AFPProduct product =
+                multiplyAFPValues(
+                    weight_value,
+                    input_value);
+
+            row_accumulator =
+                addProducts(
+                    row_accumulator,
+                    product);
         }
-        
+
         if (row_accumulator.zero)
         {
-            AFPValue zero;
-            zero.zero = true;
-            zero.negative = false;
-            zero.offset = maximum_offset;
-            zero.mantissa = 0;
-            zero.mantissa_bits = 5;
-            zero.exponent = -126;
-            output.push_back(zero);
+            output.push_back(
+                zeroValue());
         }
         else
         {
-            const int exponent = row_accumulator.exponent + integerLog2(
-                static_cast<std::uint64_t>(row_accumulator.significand));
-            output.push_back(accumulatorToAFPValue(row_accumulator, exponent, false));
+            const int exponent =
+                row_accumulator.exponent +
+                integerLog2(
+                    static_cast<std::uint64_t>(
+                        row_accumulator.significand));
+
+            output.push_back(
+                accumulatorToAFPValue(
+                    row_accumulator,
+                    exponent,
+                    false));
         }
     }
-    
-    return buildTensorFromAFPValues(output, weights.config_);
+
+    return buildTensorFromAFPValues(
+        output,
+        weights.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::matrixMultiply(
@@ -1394,146 +2005,114 @@ AFPEncodedTensor AFPArithmetic::matrixMultiply(
     std::size_t cols_a,
     std::size_t cols_b)
 {
-    if (a.size() != rows_a * cols_a)
-        throw std::invalid_argument("Matrix A size doesn't match dimensions");
-    if (b.size() != cols_a * cols_b)
-        throw std::invalid_argument("Matrix B size doesn't match dimensions");
-    
-    std::vector<AFPValue> output;
-    output.reserve(rows_a * cols_b);
-    
-    for (std::size_t i = 0; i < rows_a; ++i)
+    if (a.size() !=
+        rows_a * cols_a)
     {
-        for (std::size_t j = 0; j < cols_b; ++j)
+        throw std::invalid_argument(
+            "Matrix A size doesn't match dimensions");
+    }
+
+    if (b.size() !=
+        cols_a * cols_b)
+    {
+        throw std::invalid_argument(
+            "Matrix B size doesn't match dimensions");
+    }
+
+    std::vector<AFPValue> output;
+
+    output.reserve(
+        rows_a * cols_b);
+
+    for (std::size_t i = 0;
+         i < rows_a;
+         ++i)
+    {
+        for (std::size_t j = 0;
+             j < cols_b;
+             ++j)
         {
             AFPAccumulator element_accumulator;
-            
-            for (std::size_t k = 0; k < cols_a; ++k)
+
+            for (std::size_t k = 0;
+                 k < cols_a;
+                 ++k)
             {
-                const std::size_t a_idx = i * cols_a + k;
-                const std::size_t b_idx = k * cols_b + j;
-                
-                const std::size_t a_block = a_idx / block_size;
-                const std::size_t a_pos = a_idx % block_size;
-                const AFPValue a_value = readAFPValue(a, a_block, a_pos);
-                
-                const std::size_t b_block = b_idx / block_size;
-                const std::size_t b_pos = b_idx % block_size;
-                const AFPValue b_value = readAFPValue(b, b_block, b_pos);
-                
-                const AFPProduct product = multiplyAFPValues(a_value, b_value);
-                element_accumulator = addProducts(element_accumulator, product);
+                const std::size_t a_idx =
+                    i * cols_a + k;
+
+                const std::size_t b_idx =
+                    k * cols_b + j;
+
+                const std::size_t a_block =
+                    a_idx / block_size;
+
+                const std::size_t a_pos =
+                    a_idx % block_size;
+
+                const AFPValue a_value =
+                    readAFPValue(
+                        a,
+                        a_block,
+                        a_pos);
+
+                const std::size_t b_block =
+                    b_idx / block_size;
+
+                const std::size_t b_pos =
+                    b_idx % block_size;
+
+                const AFPValue b_value =
+                    readAFPValue(
+                        b,
+                        b_block,
+                        b_pos);
+
+                const AFPProduct product =
+                    multiplyAFPValues(
+                        a_value,
+                        b_value);
+
+                element_accumulator =
+                    addProducts(
+                        element_accumulator,
+                        product);
             }
-            
+
             if (element_accumulator.zero)
             {
-                AFPValue zero;
-                zero.zero = true;
-                zero.negative = false;
-                zero.offset = maximum_offset;
-                zero.mantissa = 0;
-                zero.mantissa_bits = 5;
-                zero.exponent = -126;
-                output.push_back(zero);
+                output.push_back(
+                    zeroValue());
             }
             else
             {
-                const int exponent = element_accumulator.exponent + integerLog2(
-                    static_cast<std::uint64_t>(element_accumulator.significand));
-                output.push_back(accumulatorToAFPValue(element_accumulator, exponent, false));
+                const int exponent =
+                    element_accumulator.exponent +
+                    integerLog2(
+                        static_cast<std::uint64_t>(
+                            element_accumulator.significand));
+
+                output.push_back(
+                    accumulatorToAFPValue(
+                        element_accumulator,
+                        exponent,
+                        false));
             }
         }
     }
-    
-    return buildTensorFromAFPValues(output, a.config_);
+
+    return buildTensorFromAFPValues(
+        output,
+        a.config_);
 }
 
 // ============================================================================
 // Public Interface - Activation Functions
 // ============================================================================
 
-AFPEncodedTensor AFPArithmetic::relu(const AFPEncodedTensor &input)
-{
-    std::vector<AFPValue> output;
-    output.reserve(input.size());
-    
-    for (std::size_t index = 0; index < input.size(); ++index)
-    {
-        const std::size_t block = index / block_size;
-        const std::size_t position = index % block_size;
-        
-        AFPValue value = readAFPValue(input, block, position);
-        output.push_back(applyReLU(value));
-    }
-    
-    return buildTensorFromAFPValues(output, input.config_);
-}
-
-AFPEncodedTensor AFPArithmetic::sigmoid(const AFPEncodedTensor &input)
-{
-    std::vector<AFPValue> output;
-    output.reserve(input.size());
-
-    // sigmoid(x) = 1/2 + x/4 - x^3/48.  The approximation is evaluated
-    // with AFP products and accumulators, avoiding a float conversion.
-    const auto makeConstant = [](int exponent, std::uint64_t mantissa,
-                                 bool negative = false) {
-        AFPValue result;
-        result.zero = false;
-        result.negative = negative;
-        result.exponent = exponent;
-        result.offset = 0;
-        result.mantissa_bits = 5;
-        result.mantissa = mantissa;
-        return result;
-    };
-    const AFPProduct half = normalizeToProduct(makeConstant(-1, 32));
-    const AFPProduct quarter = normalizeToProduct(makeConstant(-2, 32));
-    const AFPProduct inverse48 = normalizeToProduct(makeConstant(-6, 43));
-
-    for (std::size_t index = 0; index < input.size(); ++index)
-    {
-        const std::size_t block = index / block_size;
-        const std::size_t position = index % block_size;
-        AFPValue value = readAFPValue(input, block, position);
-        const AFPProduct prod = normalizeToProduct(value);
-        if (value.zero) { output.push_back(makeConstant(-1, 32)); continue; }
-        if (prod.scale_exponent >= 2) {
-            output.push_back(value.negative ? makeConstant(-1, 0) : makeConstant(0, 32));
-            output.back().zero = value.negative;
-            continue;
-        }
-        const AFPProduct x2 = multiplyAFPValues(value, value);
-        AFPProduct x3 = x2;
-        x3.significand *= prod.significand;
-        x3.scale_exponent += prod.scale_exponent;
-        x3.negative = prod.negative;
-        x3.significand *= inverse48.significand;
-        x3.scale_exponent += inverse48.scale_exponent;
-        AFPAccumulator acc;
-        acc = addProducts(acc, half);
-        AFPProduct linear = prod;
-        linear.significand *= quarter.significand;
-        linear.scale_exponent += quarter.scale_exponent;
-        acc = addProducts(acc, linear);
-        x3.negative = !x3.negative;
-        acc = addProducts(acc, x3);
-        const int exponent = acc.exponent + integerLog2(static_cast<std::uint64_t>(acc.significand));
-        output.push_back(accumulatorToAFPValue(acc, exponent, false));
-    }
-    
-    return buildTensorFromAFPValues(output, input.config_);
-}
-
-AFPEncodedTensor AFPArithmetic::tanh(
+AFPEncodedTensor AFPArithmetic::relu(
     const AFPEncodedTensor &input)
 {
-    // AFP-native rational approximation:
-    //
-    // tanh(x) ~= x(27 + x^2) / (27 + 9x^2)
-    //
-    // Clamp for |x| >= 3.
-
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
@@ -1553,7 +2132,185 @@ AFPEncodedTensor AFPArithmetic::tanh(
                 block,
                 position);
 
-        if (value.zero)
+        output.push_back(
+            applyReLU(value));
+    }
+
+    return buildTensorFromAFPValues(
+        output,
+        input.config_);
+}
+
+AFPEncodedTensor AFPArithmetic::sigmoid(
+    const AFPEncodedTensor &input)
+{
+    std::vector<AFPValue> output;
+    output.reserve(input.size());
+
+    const auto makeConstant =
+        [](int exponent,
+           std::uint64_t mantissa,
+           bool negative = false)
+    {
+        AFPValue result;
+
+        result.negative = negative;
+
+        result.exponent =
+            static_cast<std::int8_t>(
+                exponent);
+
+        result.offset = 0;
+        result.mantissa = mantissa;
+
+        return result;
+    };
+
+    const AFPProduct half =
+        normalizeToProduct(
+            makeConstant(-1, 32));
+
+    const AFPProduct quarter =
+        normalizeToProduct(
+            makeConstant(-2, 32));
+
+    const AFPProduct inverse48 =
+        normalizeToProduct(
+            makeConstant(-6, 43));
+
+    for (std::size_t index = 0;
+         index < input.size();
+         ++index)
+    {
+        const std::size_t block =
+            index / block_size;
+
+        const std::size_t position =
+            index % block_size;
+
+        AFPValue value =
+            readAFPValue(
+                input,
+                block,
+                position);
+
+        const AFPProduct prod =
+            normalizeToProduct(value);
+
+        if (isZeroAFPValue(value))
+        {
+            output.push_back(
+                makeConstant(-1, 32));
+
+            continue;
+        }
+
+        if (prod.scale_exponent >= 2)
+        {
+            output.push_back(
+                value.negative ?
+                    makeConstant(-1, 0) :
+                    makeConstant(0, 32));
+
+            if (value.negative)
+                output.back().offset =
+                    maximum_offset;
+
+            continue;
+        }
+
+        const AFPProduct x2 =
+            multiplyAFPValues(
+                value,
+                value);
+
+        AFPProduct x3 = x2;
+
+        x3.significand *=
+            prod.significand;
+
+        x3.scale_exponent +=
+            prod.scale_exponent;
+
+        x3.negative =
+            prod.negative;
+
+        x3.significand *=
+            inverse48.significand;
+
+        x3.scale_exponent +=
+            inverse48.scale_exponent;
+
+        AFPAccumulator acc;
+
+        acc =
+            addProducts(
+                acc,
+                half);
+
+        AFPProduct linear =
+            prod;
+
+        linear.significand *=
+            quarter.significand;
+
+        linear.scale_exponent +=
+            quarter.scale_exponent;
+
+        acc =
+            addProducts(
+                acc,
+                linear);
+
+        x3.negative =
+            !x3.negative;
+
+        acc =
+            addProducts(
+                acc,
+                x3);
+
+        const int exponent =
+            acc.exponent +
+            integerLog2(
+                static_cast<std::uint64_t>(
+                    acc.significand));
+
+        output.push_back(
+            accumulatorToAFPValue(
+                acc,
+                exponent,
+                false));
+    }
+
+    return buildTensorFromAFPValues(
+        output,
+        input.config_);
+}
+
+AFPEncodedTensor AFPArithmetic::tanh(
+    const AFPEncodedTensor &input)
+{
+    std::vector<AFPValue> output;
+    output.reserve(input.size());
+
+    for (std::size_t index = 0;
+         index < input.size();
+         ++index)
+    {
+        const std::size_t block =
+            index / block_size;
+
+        const std::size_t position =
+            index % block_size;
+
+        AFPValue value =
+            readAFPValue(
+                input,
+                block,
+                position);
+
+        if (isZeroAFPValue(value))
         {
             output.push_back(value);
             continue;
@@ -1562,10 +2319,10 @@ AFPEncodedTensor AFPArithmetic::tanh(
         const AFPProduct product =
             normalizeToProduct(value);
 
-        // Determine whether |x| >= 3.
         const int highest =
             product.scale_exponent +
-            integerLog2(product.significand);
+            integerLog2(
+                product.significand);
 
         bool large = false;
 
@@ -1576,40 +2333,36 @@ AFPEncodedTensor AFPArithmetic::tanh(
         else if (highest == 1)
         {
             const int shift =
-                1 - product.scale_exponent;
+                1 -
+                product.scale_exponent;
 
             if (shift >= 0 &&
                 shift < 64)
             {
                 large =
                     product.significand >=
-                    (std::uint64_t{3} << shift);
+                    (std::uint64_t{3} <<
+                     shift);
             }
         }
 
-        // Saturate for large magnitudes.
         if (large)
         {
             AFPValue result;
 
-            result.zero = false;
             result.negative =
                 value.negative;
 
             result.exponent = 0;
             result.offset = 0;
 
-            result.mantissa_bits = 5;
             result.mantissa =
                 std::uint64_t{1} << 5;
 
             output.push_back(result);
+
             continue;
         }
-
-        // ------------------------------------------------
-        // Helper: AFPProduct -> AFPAccumulator
-        // ------------------------------------------------
 
         const auto fromProduct =
             [](const AFPProduct &p)
@@ -1632,10 +2385,6 @@ AFPEncodedTensor AFPArithmetic::tanh(
             return accumulator;
         };
 
-        // ------------------------------------------------
-        // Helper: AFPAccumulator -> AFPProduct
-        // ------------------------------------------------
-
         const auto toProduct =
             [](const AFPAccumulator &a)
         {
@@ -1657,12 +2406,8 @@ AFPEncodedTensor AFPArithmetic::tanh(
             return product;
         };
 
-        // ------------------------------------------------
-        // Helper: integer constant -> AFPProduct
-        // ------------------------------------------------
-
         const auto constant =
-            [](std::uint64_t value)
+            [](std::uint64_t constant_value)
         {
             AFPProduct product;
 
@@ -1670,27 +2415,17 @@ AFPEncodedTensor AFPArithmetic::tanh(
             product.negative = false;
 
             product.significand =
-                value;
+                constant_value;
 
             product.scale_exponent = 0;
 
             return product;
         };
 
-        // ------------------------------------------------
-        // Calculate x^2
-        // ------------------------------------------------
-
         const AFPProduct square =
             multiplyAFPValues(
                 value,
                 value);
-
-        // ------------------------------------------------
-        // Numerator part:
-        //
-        // 27 + x^2
-        // ------------------------------------------------
 
         AFPAccumulator numerator_part_accumulator =
             addProducts(
@@ -1702,32 +2437,13 @@ AFPEncodedTensor AFPArithmetic::tanh(
             toProduct(
                 numerator_part_accumulator);
 
-        // Convert the AFPProduct back into an AFPValue
-        // because multiplyAFPValues() expects AFPValue
-        // operands.
-
         AFPValue numerator_part_value;
 
         if (numerator_part_product.zero ||
             numerator_part_product.significand == 0)
         {
-            numerator_part_value.zero =
-                true;
-
-            numerator_part_value.negative =
-                false;
-
-            numerator_part_value.exponent =
-                -126;
-
-            numerator_part_value.offset =
-                maximum_offset;
-
-            numerator_part_value.mantissa_bits =
-                5;
-
-            numerator_part_value.mantissa =
-                0;
+            numerator_part_value =
+                zeroValue();
         }
         else
         {
@@ -1743,31 +2459,15 @@ AFPEncodedTensor AFPArithmetic::tanh(
                     false);
         }
 
-        // ------------------------------------------------
-        // Numerator:
-        //
-        // x(27 + x^2)
-        // ------------------------------------------------
-
         const AFPProduct numerator =
             multiplyAFPValues(
                 value,
                 numerator_part_value);
 
-        // ------------------------------------------------
-        // Calculate 9x^2
-        // ------------------------------------------------
-
         AFPProduct nine_square =
             square;
 
         nine_square.significand *= 9;
-
-        // ------------------------------------------------
-        // Denominator:
-        //
-        // 27 + 9x^2
-        // ------------------------------------------------
 
         AFPAccumulator denominator_accumulator =
             addProducts(
@@ -1779,43 +2479,16 @@ AFPEncodedTensor AFPArithmetic::tanh(
             toProduct(
                 denominator_accumulator);
 
-        // Safety check.
-        //
-        // Mathematically this denominator should always
-        // be positive, but avoid division by zero.
-
         if (denominator.zero ||
             denominator.significand == 0)
         {
-            AFPValue zero;
+            output.push_back(
+                zeroValue());
 
-            zero.zero = true;
-            zero.negative = false;
-
-            zero.exponent = -126;
-            zero.offset = maximum_offset;
-
-            zero.mantissa_bits = 5;
-            zero.mantissa = 0;
-
-            output.push_back(zero);
             continue;
         }
 
-        // ------------------------------------------------
-        // AFP division
-        //
-        // numerator / denominator
-        //
-        // Extend the numerator precision using a 64-bit
-        // fixed-point shift.
-        // ------------------------------------------------
-
         constexpr int precision = 24;
-
-        // Avoid __uint128_t.
-        //
-        // Ensure the shift will fit inside uint64_t.
 
         std::uint64_t numerator_significand =
             numerator.significand;
@@ -1823,11 +2496,9 @@ AFPEncodedTensor AFPArithmetic::tanh(
         int numerator_scale =
             numerator.scale_exponent;
 
-        // Normalize downward if shifting by precision
-        // would overflow uint64_t.
+        (void)numerator_scale;
 
-        constexpr int max_shift =
-            63;
+        constexpr int max_shift = 63;
 
         int available_shift =
             max_shift -
@@ -1835,14 +2506,12 @@ AFPEncodedTensor AFPArithmetic::tanh(
                 numerator_significand);
 
         if (available_shift < 0)
-        {
             available_shift = 0;
-        }
 
         const int actual_precision =
-            precision < available_shift
-                ? precision
-                : available_shift;
+            precision < available_shift ?
+                precision :
+                available_shift;
 
         const std::uint64_t scaled_numerator =
             numerator_significand <<
@@ -1861,9 +2530,7 @@ AFPEncodedTensor AFPArithmetic::tanh(
         if (result.zero)
         {
             result.significand = 0;
-
-            result.scale_exponent =
-                0;
+            result.scale_exponent = 0;
         }
         else
         {
@@ -1883,24 +2550,10 @@ AFPEncodedTensor AFPArithmetic::tanh(
             }
         }
 
-        // ------------------------------------------------
-        // Convert result back into AFP format.
-        // ------------------------------------------------
-
         if (result.zero)
         {
-            AFPValue zero;
-
-            zero.zero = true;
-            zero.negative = false;
-
-            zero.exponent = -126;
-            zero.offset = maximum_offset;
-
-            zero.mantissa_bits = 5;
-            zero.mantissa = 0;
-
-            output.push_back(zero);
+            output.push_back(
+                zeroValue());
         }
         else
         {
@@ -1925,50 +2578,40 @@ AFPEncodedTensor AFPArithmetic::tanh(
 AFPEncodedTensor AFPArithmetic::gelu(
     const AFPEncodedTensor &input)
 {
-    /*
-     * Approximate:
-     *
-     * GELU(x) =
-     * 0.5*x*(1+tanh(0.79788456*(x+0.044715*x^3)))
-     *
-     * AFP constants:
-     *
-     * 0.5        = 2^-1
-     * 0.7979     ≈ 0.75
-     * 0.044715   ≈ 2^-4 = 0.0625
-     *
-     * The constants are deliberately AFP-friendly.
-     */
-
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    const AFPValue half = halfValue();
+    const AFPValue half =
+        halfValue();
 
     AFPValue three_quarters;
+
     three_quarters.negative = false;
     three_quarters.exponent = -1;
     three_quarters.offset = 0;
-    three_quarters.mantissa_bits = 5;
     three_quarters.mantissa =
         (std::uint64_t{1} << 5) + 16;
-    three_quarters.zero = false;
 
     AFPValue one_sixteenth;
+
     one_sixteenth.negative = false;
     one_sixteenth.exponent = -4;
     one_sixteenth.offset = 0;
-    one_sixteenth.mantissa_bits = 5;
     one_sixteenth.mantissa =
         std::uint64_t{1} << 5;
-    one_sixteenth.zero = false;
 
-    const AFPValue one = oneValue();
+    const AFPValue one =
+        oneValue();
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue x =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         const AFPValue x2 =
             multiplyValues(x, x);
@@ -1977,202 +2620,178 @@ AFPEncodedTensor AFPArithmetic::gelu(
             multiplyValues(x2, x);
 
         const AFPValue cubic =
-            multiplyValues(x3, one_sixteenth);
+            multiplyValues(
+                x3,
+                one_sixteenth);
 
         const AFPValue inner =
-            addValues(x, cubic);
+            addValues(
+                x,
+                cubic);
 
         const AFPValue scaled =
-            multiplyValues(inner, three_quarters);
+            multiplyValues(
+                inner,
+                three_quarters);
 
-        const AFPValue t =
+        const AFPEncodedTensor tanh_tensor =
             tanh(
                 buildTensorFromAFPValues(
                     {scaled},
-                    input.config_
-                )
-            ).size() == 0
-            ? zeroValue()
-            : readAFPValue(
-                tanh(
-                    buildTensorFromAFPValues(
-                        {scaled},
-                        input.config_
-                    )
-                ),
-                0,
-                0
-            );
+                    input.config_));
+
+        const AFPValue t =
+            tanh_tensor.size() == 0 ?
+                zeroValue() :
+                readAFPValue(
+                    tanh_tensor,
+                    0,
+                    0);
 
         const AFPValue one_plus_t =
-            addValues(one, t);
+            addValues(
+                one,
+                t);
 
         const AFPValue half_x =
-            multiplyValues(x, half);
+            multiplyValues(
+                x,
+                half);
 
         output.push_back(
-            multiplyValues(half_x, one_plus_t)
-        );
+            multiplyValues(
+                half_x,
+                one_plus_t));
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPArithmetic::AFPValue AFPArithmetic::expValue(
     const AFPValue &value)
 {
-    if (value.zero)
+    if (isZeroAFPValue(value))
         return oneValue();
 
-    /*
-     * exp(x) =
-     *
-     * 1
-     * + x
-     * + x^2 / 2
-     * + x^3 / 6
-     * + x^4 / 24
-     * + x^5 / 120
-     * + x^6 / 720
-     *
-     * This is accurate enough for the small range normally
-     * encountered by activation functions and softmax.
-     */
-
-    const AFPValue one = oneValue();
-
-    /*
-     * Constants.
-     *
-     * These are represented directly as AFP values.
-     *
-     * 1/2  = 0.5
-     * 1/6  ≈ 0.1667
-     * 1/24 ≈ 0.04167
-     * 1/120 ≈ 0.00833
-     * 1/720 ≈ 0.001389
-     */
+    const AFPValue one =
+        oneValue();
 
     AFPValue half;
+
     half.negative = false;
     half.exponent = -1;
     half.offset = 0;
-    half.mantissa_bits = 5;
     half.mantissa = 32;
-    half.zero = false;
 
     AFPValue one_sixth;
+
     one_sixth.negative = false;
     one_sixth.exponent = -3;
     one_sixth.offset = 0;
-    one_sixth.mantissa_bits = 5;
     one_sixth.mantissa = 43;
-    one_sixth.zero = false;
 
     AFPValue one_twenty_fourth;
+
     one_twenty_fourth.negative = false;
     one_twenty_fourth.exponent = -5;
     one_twenty_fourth.offset = 0;
-    one_twenty_fourth.mantissa_bits = 5;
     one_twenty_fourth.mantissa = 43;
-    one_twenty_fourth.zero = false;
 
     AFPValue one_one_twentieth;
+
     one_one_twentieth.negative = false;
     one_one_twentieth.exponent = -7;
     one_one_twentieth.offset = 0;
-    one_one_twentieth.mantissa_bits = 5;
     one_one_twentieth.mantissa = 43;
-    one_one_twentieth.zero = false;
 
     AFPValue one_seven_twentieth;
+
     one_seven_twentieth.negative = false;
     one_seven_twentieth.exponent = -9;
     one_seven_twentieth.offset = 0;
-    one_seven_twentieth.mantissa_bits = 5;
     one_seven_twentieth.mantissa = 45;
-    one_seven_twentieth.zero = false;
 
-    /*
-     * x²
-     */
     const AFPValue x2 =
-        multiplyValues(value, value);
+        multiplyValues(
+            value,
+            value);
 
-    /*
-     * x³
-     */
     const AFPValue x3 =
-        multiplyValues(x2, value);
+        multiplyValues(
+            x2,
+            value);
 
-    /*
-     * x⁴
-     */
     const AFPValue x4 =
-        multiplyValues(x3, value);
+        multiplyValues(
+            x3,
+            value);
 
-    /*
-     * x⁵
-     */
     const AFPValue x5 =
-        multiplyValues(x4, value);
+        multiplyValues(
+            x4,
+            value);
 
-    /*
-     * x⁶
-     */
     const AFPValue x6 =
-        multiplyValues(x5, value);
+        multiplyValues(
+            x5,
+            value);
 
-    /*
-     * x² / 2
-     */
     const AFPValue term2 =
-        multiplyValues(x2, half);
+        multiplyValues(
+            x2,
+            half);
 
-    /*
-     * x³ / 6
-     */
     const AFPValue term3 =
-        multiplyValues(x3, one_sixth);
+        multiplyValues(
+            x3,
+            one_sixth);
 
-    /*
-     * x⁴ / 24
-     */
     const AFPValue term4 =
-        multiplyValues(x4, one_twenty_fourth);
+        multiplyValues(
+            x4,
+            one_twenty_fourth);
 
-    /*
-     * x⁵ / 120
-     */
     const AFPValue term5 =
-        multiplyValues(x5, one_one_twentieth);
+        multiplyValues(
+            x5,
+            one_one_twentieth);
 
-    /*
-     * x⁶ / 720
-     */
     const AFPValue term6 =
-        multiplyValues(x6, one_seven_twentieth);
+        multiplyValues(
+            x6,
+            one_seven_twentieth);
 
     AFPValue result =
-        addValues(one, value);
+        addValues(
+            one,
+            value);
 
     result =
-        addValues(result, term2);
+        addValues(
+            result,
+            term2);
 
     result =
-        addValues(result, term3);
+        addValues(
+            result,
+            term3);
 
     result =
-        addValues(result, term4);
+        addValues(
+            result,
+            term4);
 
     result =
-        addValues(result, term5);
+        addValues(
+            result,
+            term5);
 
     result =
-        addValues(result, term6);
+        addValues(
+            result,
+            term6);
 
     return result;
 }
@@ -2183,20 +2802,23 @@ AFPEncodedTensor AFPArithmetic::exp(
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         output.push_back(
-            expValue(value)
-        );
+            expValue(value));
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::softmax(
@@ -2205,36 +2827,49 @@ AFPEncodedTensor AFPArithmetic::softmax(
     if (input.size() == 0)
         return input;
 
-    /*
-     * Find maximum.
-     */
     AFPValue maximum_value =
-        readAFPValue(input, 0, 0);
+        readAFPValue(
+            input,
+            0,
+            0);
 
-    for (std::size_t i = 1; i < input.size(); ++i)
+    for (std::size_t i = 1;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
-        if (compareAFPValues(value, maximum_value) > 0)
+        if (compareAFPValues(
+                value,
+                maximum_value) > 0)
+        {
             maximum_value = value;
+        }
     }
 
-    /*
-     * Compute exponentials after subtracting maximum.
-     */
     std::vector<AFPValue> exponentials;
     exponentials.reserve(input.size());
 
     AFPAccumulator denominator;
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         const AFPValue shifted =
-            subtractValues(value, maximum_value);
+            subtractValues(
+                value,
+                maximum_value);
 
         const AFPValue e =
             expValue(shifted);
@@ -2245,7 +2880,9 @@ AFPEncodedTensor AFPArithmetic::softmax(
             normalizeToProduct(e);
 
         denominator =
-            addProducts(denominator, product);
+            addProducts(
+                denominator,
+                product);
     }
 
     if (denominator.zero)
@@ -2253,46 +2890,38 @@ AFPEncodedTensor AFPArithmetic::softmax(
         return buildTensorFromAFPValues(
             std::vector<AFPValue>(
                 input.size(),
-                zeroValue()
-            ),
-            input.config_
-        );
+                zeroValue()),
+            input.config_);
     }
 
     const int denominator_exponent =
         denominator.exponent +
         integerLog2(
             static_cast<std::uint64_t>(
-                denominator.significand
-            )
-        );
+                denominator.significand));
 
     const AFPValue denominator_value =
         accumulatorToAFPValue(
             denominator,
             denominator_exponent,
-            false
-        );
+            false);
 
-    /*
-     * Normalize each exponential.
-     */
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (const AFPValue &e : exponentials)
+    for (const AFPValue &e :
+         exponentials)
     {
         output.push_back(
-            divideValues(e, denominator_value)
-        );
+            divideValues(
+                e,
+                denominator_value));
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
-
 
 // ============================================================================
 // AFP Scalar Helpers
@@ -2306,8 +2935,6 @@ AFPArithmetic::AFPValue AFPArithmetic::zeroValue()
     value.exponent = -126;
     value.offset = maximum_offset;
     value.mantissa = 0;
-    value.mantissa_bits = 5;
-    value.zero = true;
 
     return value;
 }
@@ -2319,9 +2946,8 @@ AFPArithmetic::AFPValue AFPArithmetic::oneValue()
     value.negative = false;
     value.exponent = 0;
     value.offset = 0;
-    value.mantissa_bits = 5;
-    value.mantissa = std::uint64_t{1} << 5;
-    value.zero = false;
+    value.mantissa =
+        std::uint64_t{1} << 5;
 
     return value;
 }
@@ -2333,9 +2959,8 @@ AFPArithmetic::AFPValue AFPArithmetic::twoValue()
     value.negative = false;
     value.exponent = 1;
     value.offset = 0;
-    value.mantissa_bits = 5;
-    value.mantissa = std::uint64_t{1} << 5;
-    value.zero = false;
+    value.mantissa =
+        std::uint64_t{1} << 5;
 
     return value;
 }
@@ -2347,9 +2972,8 @@ AFPArithmetic::AFPValue AFPArithmetic::halfValue()
     value.negative = false;
     value.exponent = -1;
     value.offset = 0;
-    value.mantissa_bits = 5;
-    value.mantissa = std::uint64_t{1} << 5;
-    value.zero = false;
+    value.mantissa =
+        std::uint64_t{1} << 5;
 
     return value;
 }
@@ -2358,114 +2982,141 @@ AFPArithmetic::AFPValue AFPArithmetic::addValues(
     const AFPValue &a,
     const AFPValue &b)
 {
-    const AFPAccumulator acc = addAFPValues(a, b);
+    const AFPAccumulator acc =
+        addAFPValues(a, b);
 
     if (acc.zero)
         return zeroValue();
 
     const int exponent =
         acc.exponent +
-        integerLog2(static_cast<std::uint64_t>(acc.significand));
+        integerLog2(
+            static_cast<std::uint64_t>(
+                acc.significand));
 
     return accumulatorToAFPValue(
         acc,
         exponent,
-        false
-    );
+        false);
 }
 
 AFPArithmetic::AFPValue AFPArithmetic::subtractValues(
     const AFPValue &a,
     const AFPValue &b)
 {
-    const AFPAccumulator acc = subtractAFPValues(a, b);
+    const AFPAccumulator acc =
+        subtractAFPValues(a, b);
 
     if (acc.zero)
         return zeroValue();
 
     const int exponent =
         acc.exponent +
-        integerLog2(static_cast<std::uint64_t>(acc.significand));
+        integerLog2(
+            static_cast<std::uint64_t>(
+                acc.significand));
 
     return accumulatorToAFPValue(
         acc,
         exponent,
-        false
-    );
+        false);
 }
 
 AFPArithmetic::AFPValue AFPArithmetic::multiplyValues(
     const AFPValue &a,
     const AFPValue &b)
 {
-    const AFPProduct product = multiplyAFPValues(a, b);
+    const AFPProduct product =
+        multiplyAFPValues(a, b);
 
     if (product.zero)
         return zeroValue();
 
     AFPAccumulator acc;
 
-    acc.negative = product.negative;
+    acc.negative =
+        product.negative;
+
     acc.significand =
-        static_cast<std::int64_t>(product.significand);
-    acc.exponent = product.scale_exponent;
+        static_cast<std::int64_t>(
+            product.significand);
+
+    acc.exponent =
+        product.scale_exponent;
+
     acc.zero = false;
 
     const int exponent =
         acc.exponent +
-        integerLog2(static_cast<std::uint64_t>(acc.significand));
+        integerLog2(
+            static_cast<std::uint64_t>(
+                acc.significand));
 
     return accumulatorToAFPValue(
         acc,
         exponent,
-        false
-    );
+        false);
 }
 
 AFPArithmetic::AFPValue AFPArithmetic::divideValues(
     const AFPValue &a,
     const AFPValue &b)
 {
-    const AFPProduct product = divideAFPValues(a, b);
+    const AFPProduct product =
+        divideAFPValues(a, b);
 
     if (product.zero)
         return zeroValue();
 
     AFPAccumulator acc;
 
-    acc.negative = product.negative;
+    acc.negative =
+        product.negative;
+
     acc.significand =
-        static_cast<std::int64_t>(product.significand);
-    acc.exponent = product.scale_exponent;
+        static_cast<std::int64_t>(
+            product.significand);
+
+    acc.exponent =
+        product.scale_exponent;
+
     acc.zero = false;
 
     const int exponent =
         acc.exponent +
-        integerLog2(static_cast<std::uint64_t>(acc.significand));
+        integerLog2(
+            static_cast<std::uint64_t>(
+                acc.significand));
 
     return accumulatorToAFPValue(
         acc,
         exponent,
-        false
-    );
+        false);
 }
 
 AFPArithmetic::AFPValue AFPArithmetic::scalePowerOfTwo(
     const AFPValue &value,
     int power)
 {
-    if (value.zero)
+    if (isZeroAFPValue(value))
         return value;
 
     AFPValue result = value;
 
-    result.exponent += power;
+    int exponent =
+        static_cast<int>(
+            result.exponent) +
+        power;
 
-    if (result.exponent < -126)
-        result.exponent = -126;
+    if (exponent < -126)
+        exponent = -126;
 
-    if (result.exponent > 127)
-        result.exponent = 127;
+    if (exponent > 127)
+        exponent = 127;
+
+    result.exponent =
+        static_cast<std::int8_t>(
+            exponent);
 
     return result;
 }
@@ -2474,52 +3125,73 @@ AFPArithmetic::AFPValue AFPArithmetic::scalePowerOfTwo(
 // Public Interface - Reduction Operations
 // ============================================================================
 
-AFPEncodedTensor AFPArithmetic::sum(const AFPEncodedTensor &input)
+AFPEncodedTensor AFPArithmetic::sum(
+    const AFPEncodedTensor &input)
 {
     if (input.size() == 0)
     {
         std::vector<AFPValue> zero_values(1);
-        zero_values[0].zero = true;
-        zero_values[0].offset = maximum_offset;
-        zero_values[0].mantissa = 0;
-        zero_values[0].mantissa_bits = 5;
-        zero_values[0].exponent = -126;
-        zero_values[0].negative = false;
-        return buildTensorFromAFPValues(zero_values, input.config_);
+
+        zero_values[0] =
+            zeroValue();
+
+        return buildTensorFromAFPValues(
+            zero_values,
+            input.config_);
     }
-    
+
     AFPAccumulator total;
-    
-    for (std::size_t index = 0; index < input.size(); ++index)
+
+    for (std::size_t index = 0;
+         index < input.size();
+         ++index)
     {
-        const std::size_t block = index / block_size;
-        const std::size_t position = index % block_size;
-        
-        const AFPValue value = readAFPValue(input, block, position);
-        const AFPProduct product = normalizeToProduct(value);
-        total = addProducts(total, product);
+        const std::size_t block =
+            index / block_size;
+
+        const std::size_t position =
+            index % block_size;
+
+        const AFPValue value =
+            readAFPValue(
+                input,
+                block,
+                position);
+
+        const AFPProduct product =
+            normalizeToProduct(value);
+
+        total =
+            addProducts(
+                total,
+                product);
     }
-    
+
     std::vector<AFPValue> result_values;
+
     if (total.zero)
     {
-        AFPValue zero;
-        zero.zero = true;
-        zero.negative = false;
-        zero.offset = maximum_offset;
-        zero.mantissa = 0;
-        zero.mantissa_bits = 5;
-        zero.exponent = -126;
-        result_values.push_back(zero);
+        result_values.push_back(
+            zeroValue());
     }
     else
     {
-        const int exponent = total.exponent + integerLog2(
-            static_cast<std::uint64_t>(total.significand));
-        result_values.push_back(accumulatorToAFPValue(total, exponent, false));
+        const int exponent =
+            total.exponent +
+            integerLog2(
+                static_cast<std::uint64_t>(
+                    total.significand));
+
+        result_values.push_back(
+            accumulatorToAFPValue(
+                total,
+                exponent,
+                false));
     }
-    
-    return buildTensorFromAFPValues(result_values, input.config_);
+
+    return buildTensorFromAFPValues(
+        result_values,
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::mean(
@@ -2529,23 +3201,20 @@ AFPEncodedTensor AFPArithmetic::mean(
     {
         return buildTensorFromAFPValues(
             {zeroValue()},
-            input.config_
-        );
+            input.config_);
     }
 
-    /*
-     * Accumulate all values in AFP form.
-     */
     AFPAccumulator accumulator;
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
             readAFPValue(
                 input,
                 i / block_size,
-                i % block_size
-            );
+                i % block_size);
 
         const AFPProduct product =
             normalizeToProduct(value);
@@ -2553,60 +3222,45 @@ AFPEncodedTensor AFPArithmetic::mean(
         accumulator =
             addProducts(
                 accumulator,
-                product
-            );
+                product);
     }
 
     if (accumulator.zero)
     {
         return buildTensorFromAFPValues(
             {zeroValue()},
-            input.config_
-        );
+            input.config_);
     }
 
-    /*
-     * Convert the accumulator back into an AFP value.
-     */
     const int exponent =
         accumulator.exponent +
         integerLog2(
             static_cast<std::uint64_t>(
-                accumulator.significand
-            )
-        );
+                accumulator.significand));
 
     AFPValue sum_value =
         accumulatorToAFPValue(
             accumulator,
             exponent,
-            false
-        );
+            false);
 
-    /*
-     * Construct N as an AFP value.
-     *
-     * This avoids converting N through FP32.
-     */
     AFPValue count;
 
     count.negative = false;
-    count.zero = false;
     count.offset = 0;
-    count.mantissa_bits = 5;
 
-    const std::size_t n = input.size();
+    const std::size_t n =
+        input.size();
 
     const int n_exponent =
-        integerLog2(static_cast<std::uint64_t>(n));
+        integerLog2(
+            static_cast<std::uint64_t>(
+                n));
 
-    count.exponent = n_exponent;
+    count.exponent =
+        static_cast<std::int8_t>(
+            n_exponent);
 
-    /*
-     * Normalize N into the AFP mantissa representation.
-     *
-     * N = mantissa * 2^exponent
-     */
     const std::uint64_t normalized_n =
         static_cast<std::uint64_t>(n)
         << 5;
@@ -2617,132 +3271,144 @@ AFPEncodedTensor AFPArithmetic::mean(
     count.mantissa =
         shiftRightRounded(
             normalized_n,
-            shift
-        );
+            shift);
 
     if (count.mantissa == 0)
-    {
         count.mantissa = 1;
-    }
 
-    /*
-     * mean = sum / N
-     */
     AFPValue mean_value =
         divideValues(
             sum_value,
-            count
-        );
+            count);
 
     return buildTensorFromAFPValues(
         {mean_value},
-        input.config_
-    );
+        input.config_);
 }
 
-AFPEncodedTensor AFPArithmetic::max(const AFPEncodedTensor &input)
+AFPEncodedTensor AFPArithmetic::max(
+    const AFPEncodedTensor &input)
 {
     if (input.size() == 0)
     {
         std::vector<AFPValue> zero_values(1);
-        zero_values[0].zero = true;
-        zero_values[0].offset = maximum_offset;
-        zero_values[0].mantissa = 0;
-        zero_values[0].mantissa_bits = 5;
-        zero_values[0].exponent = -126;
-        zero_values[0].negative = false;
-        return buildTensorFromAFPValues(zero_values, input.config_);
+
+        zero_values[0] =
+            zeroValue();
+
+        return buildTensorFromAFPValues(
+            zero_values,
+            input.config_);
     }
-    
-    // Find maximum using AFP comparison
-    AFPValue max_value = readAFPValue(input, 0, 0);
-    
-    for (std::size_t index = 1; index < input.size(); ++index)
+
+    AFPValue max_value =
+        readAFPValue(
+            input,
+            0,
+            0);
+
+    for (std::size_t index = 1;
+         index < input.size();
+         ++index)
     {
-        const std::size_t block = index / block_size;
-        const std::size_t position = index % block_size;
-        
-        const AFPValue current = readAFPValue(input, block, position);
-        
-        // Compare by converting to product representation
-        const AFPProduct max_prod = normalizeToProduct(max_value);
-        const AFPProduct curr_prod = normalizeToProduct(current);
-        
-        if (current.zero)
+        const std::size_t block =
+            index / block_size;
+
+        const std::size_t position =
+            index % block_size;
+
+        const AFPValue current =
+            readAFPValue(
+                input,
+                block,
+                position);
+
+        const AFPProduct max_prod =
+            normalizeToProduct(
+                max_value);
+
+        const AFPProduct curr_prod =
+            normalizeToProduct(
+                current);
+
+        if (isZeroAFPValue(current))
             continue;
-        
-        if (max_value.zero)
+
+        if (isZeroAFPValue(max_value))
         {
             max_value = current;
             continue;
         }
-        
-        // Compare magnitudes
-        if (max_prod.scale_exponent > curr_prod.scale_exponent)
+
+        if (max_prod.scale_exponent >
+            curr_prod.scale_exponent)
         {
-            // max is larger magnitude
             if (!max_value.negative)
-                continue; // max is positive and larger
+                continue;
             else if (!current.negative)
             {
-                max_value = current; // current is positive, max is negative
+                max_value = current;
                 continue;
             }
             else
             {
-                // Both negative, more negative is smaller
                 max_value = current;
                 continue;
             }
         }
-        else if (curr_prod.scale_exponent > max_prod.scale_exponent)
+        else if (curr_prod.scale_exponent >
+                 max_prod.scale_exponent)
         {
-            // current is larger magnitude
             if (!current.negative)
             {
-                max_value = current; // current is positive and larger
+                max_value = current;
                 continue;
             }
             else if (!max_value.negative)
             {
-                continue; // max is positive, current is negative
+                continue;
             }
             else
             {
-                continue; // Both negative, max is less negative (larger)
+                continue;
             }
         }
         else
         {
-            // Same exponent, compare significands
-            if (max_prod.significand > curr_prod.significand)
+            if (max_prod.significand >
+                curr_prod.significand)
             {
                 if (!max_value.negative)
-                    continue; // max is positive and larger
+                    continue;
                 else
                 {
-                    max_value = current; // Both negative, current is less negative
+                    max_value = current;
                     continue;
                 }
             }
-            else if (curr_prod.significand > max_prod.significand)
+            else if (curr_prod.significand >
+                     max_prod.significand)
             {
                 if (!current.negative)
                 {
-                    max_value = current; // current is positive and larger
+                    max_value = current;
                     continue;
                 }
                 else
                 {
-                    continue; // Both negative, max is less negative
+                    continue;
                 }
             }
-            // Equal values, keep max
         }
     }
-    
-    std::vector<AFPValue> result_values(1, max_value);
-    return buildTensorFromAFPValues(result_values, input.config_);
+
+    std::vector<AFPValue> result_values(
+        1,
+        max_value);
+
+    return buildTensorFromAFPValues(
+        result_values,
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::sumSquares(
@@ -2750,23 +3416,33 @@ AFPEncodedTensor AFPArithmetic::sumSquares(
 {
     AFPAccumulator accumulator;
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         const AFPProduct square =
-            multiplyAFPValues(value, value);
+            multiplyAFPValues(
+                value,
+                value);
 
         accumulator =
-            addProducts(accumulator, square);
+            addProducts(
+                accumulator,
+                square);
     }
 
     std::vector<AFPValue> result;
 
     if (accumulator.zero)
     {
-        result.push_back(zeroValue());
+        result.push_back(
+            zeroValue());
     }
     else
     {
@@ -2774,29 +3450,24 @@ AFPEncodedTensor AFPArithmetic::sumSquares(
             accumulator.exponent +
             integerLog2(
                 static_cast<std::uint64_t>(
-                    accumulator.significand
-                )
-            );
+                    accumulator.significand));
 
         result.push_back(
             accumulatorToAFPValue(
                 accumulator,
                 exponent,
-                false
-            )
-        );
+                false));
     }
 
     return buildTensorFromAFPValues(
         result,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPArithmetic::AFPValue AFPArithmetic::reciprocalValue(
     const AFPValue &value)
 {
-    if (value.zero)
+    if (isZeroAFPValue(value))
         throw std::invalid_argument(
             "AFP reciprocal: division by zero");
 
@@ -2805,45 +3476,46 @@ AFPArithmetic::AFPValue AFPArithmetic::reciprocalValue(
 
     const int top =
         p.scale_exponent +
-        integerLog2(p.significand);
+        integerLog2(
+            p.significand);
 
-    /*
-     * Initial approximation:
-     *
-     * x ≈ m * 2^top
-     * 1/x ≈ 2^-top
-     *
-     * This is intentionally coarse; Newton iterations
-     * recover the lost precision.
-     */
     AFPValue estimate;
 
-    estimate.negative = value.negative;
-    estimate.exponent = -top;
+    estimate.negative =
+        value.negative;
+
+    estimate.exponent =
+        static_cast<std::int8_t>(
+            -top);
+
     estimate.offset = 0;
-    estimate.mantissa_bits = 5;
-    estimate.mantissa = std::uint64_t{1} << 5;
-    estimate.zero = false;
 
-    const AFPValue two = twoValue();
+    estimate.mantissa =
+        std::uint64_t{1} << 5;
 
-    /*
-     * Newton-Raphson:
-     *
-     * y = y * (2 - x*y)
-     */
-    for (int iteration = 0; iteration < 3; ++iteration)
+    const AFPValue two =
+        twoValue();
+
+    for (int iteration = 0;
+         iteration < 3;
+         ++iteration)
     {
         const AFPValue xy =
-            multiplyValues(value, estimate);
+            multiplyValues(
+                value,
+                estimate);
 
         const AFPValue correction =
-            subtractValues(two, xy);
+            subtractValues(
+                two,
+                xy);
 
         estimate =
-            multiplyValues(estimate, correction);
+            multiplyValues(
+                estimate,
+                correction);
 
-        if (estimate.zero)
+        if (isZeroAFPValue(estimate))
             break;
     }
 
@@ -2857,69 +3529,70 @@ AFPEncodedTensor AFPArithmetic::rms(
     {
         return buildTensorFromAFPValues(
             {zeroValue()},
-            input.config_
-        );
+            input.config_);
     }
 
     AFPAccumulator accumulator;
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         const AFPProduct square =
-            multiplyAFPValues(value, value);
+            multiplyAFPValues(
+                value,
+                value);
 
         accumulator =
-            addProducts(accumulator, square);
+            addProducts(
+                accumulator,
+                square);
     }
 
     if (accumulator.zero)
     {
         return buildTensorFromAFPValues(
             {zeroValue()},
-            input.config_
-        );
+            input.config_);
     }
 
     const int exponent =
         accumulator.exponent +
         integerLog2(
             static_cast<std::uint64_t>(
-                accumulator.significand
-            )
-        );
+                accumulator.significand));
 
     AFPValue total =
         accumulatorToAFPValue(
             accumulator,
             exponent,
-            false
-        );
+            false);
 
-    /*
-     * Divide by N using repeated power-of-two approximation.
-     *
-     * Since AFP's exponent is binary, this handles powers
-     * of two exactly and gives a good AFP approximation for
-     * other sizes.
-     */
-    std::size_t n = input.size();
+    std::size_t n =
+        input.size();
+
     int log_n = 0;
 
     while ((std::size_t{1} << log_n) < n)
         ++log_n;
 
-    total = scalePowerOfTwo(total, -log_n);
+    total =
+        scalePowerOfTwo(
+            total,
+            -log_n);
 
     const AFPValue result =
         sqrtValue(total);
 
     return buildTensorFromAFPValues(
         {result},
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::reciprocal(
@@ -2928,26 +3601,29 @@ AFPEncodedTensor AFPArithmetic::reciprocal(
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         output.push_back(
-            reciprocalValue(value)
-        );
+            reciprocalValue(value));
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPArithmetic::AFPValue AFPArithmetic::sqrtValue(
     const AFPValue &value)
 {
-    if (value.zero)
+    if (isZeroAFPValue(value))
         return zeroValue();
 
     if (value.negative)
@@ -2959,40 +3635,46 @@ AFPArithmetic::AFPValue AFPArithmetic::sqrtValue(
 
     const int top =
         p.scale_exponent +
-        integerLog2(p.significand);
+        integerLog2(
+            p.significand);
 
-    /*
-     * Start with 2^(floor(top/2)).
-     */
     const int initial_exponent =
         top / 2;
 
     AFPValue estimate;
 
     estimate.negative = false;
-    estimate.exponent = initial_exponent;
+
+    estimate.exponent =
+        static_cast<std::int8_t>(
+            initial_exponent);
+
     estimate.offset = 0;
-    estimate.mantissa_bits = 5;
-    estimate.mantissa = std::uint64_t{1} << 5;
-    estimate.zero = false;
 
-    const AFPValue half = halfValue();
+    estimate.mantissa =
+        std::uint64_t{1} << 5;
 
-    /*
-     * Newton-Raphson:
-     *
-     * y = 0.5 * (y + x/y)
-     */
-    for (int iteration = 0; iteration < 4; ++iteration)
+    const AFPValue half =
+        halfValue();
+
+    for (int iteration = 0;
+         iteration < 4;
+         ++iteration)
     {
         const AFPValue quotient =
-            divideValues(value, estimate);
+            divideValues(
+                value,
+                estimate);
 
         const AFPValue sum =
-            addValues(estimate, quotient);
+            addValues(
+                estimate,
+                quotient);
 
         estimate =
-            multiplyValues(sum, half);
+            multiplyValues(
+                sum,
+                half);
     }
 
     return estimate;
@@ -3004,20 +3686,23 @@ AFPEncodedTensor AFPArithmetic::sqrt(
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         output.push_back(
-            sqrtValue(value)
-        );
+            sqrtValue(value));
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::reciprocalSqrt(
@@ -3026,23 +3711,26 @@ AFPEncodedTensor AFPArithmetic::reciprocalSqrt(
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         const AFPValue root =
             sqrtValue(value);
 
         output.push_back(
-            reciprocalValue(root)
-        );
+            reciprocalValue(root));
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::rmsNorm(
@@ -3055,28 +3743,36 @@ AFPEncodedTensor AFPArithmetic::rmsNorm(
         rms(input);
 
     const AFPValue rms_value =
-        readAFPValue(rms_tensor, 0, 0);
+        readAFPValue(
+            rms_tensor,
+            0,
+            0);
 
-    if (rms_value.zero)
+    if (isZeroAFPValue(rms_value))
         return input;
 
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
-            readAFPValue(input, i / block_size, i % block_size);
+            readAFPValue(
+                input,
+                i / block_size,
+                i % block_size);
 
         output.push_back(
-            divideValues(value, rms_value)
-        );
+            divideValues(
+                value,
+                rms_value));
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::layerNorm(
@@ -3085,19 +3781,17 @@ AFPEncodedTensor AFPArithmetic::layerNorm(
     if (input.size() == 0)
         return input;
 
-    /*
-     * Compute mean.
-     */
     AFPAccumulator mean_accumulator;
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
             readAFPValue(
                 input,
                 i / block_size,
-                i % block_size
-            );
+                i % block_size);
 
         const AFPProduct product =
             normalizeToProduct(value);
@@ -3105,8 +3799,7 @@ AFPEncodedTensor AFPArithmetic::layerNorm(
         mean_accumulator =
             addProducts(
                 mean_accumulator,
-                product
-            );
+                product);
     }
 
     if (mean_accumulator.zero)
@@ -3114,31 +3807,25 @@ AFPEncodedTensor AFPArithmetic::layerNorm(
         return buildTensorFromAFPValues(
             std::vector<AFPValue>(
                 input.size(),
-                zeroValue()
-            ),
-            input.config_
-        );
+                zeroValue()),
+            input.config_);
     }
 
     const int mean_exponent =
         mean_accumulator.exponent +
         integerLog2(
             static_cast<std::uint64_t>(
-                mean_accumulator.significand
-            )
-        );
+                mean_accumulator.significand));
 
     AFPValue mean_value =
         accumulatorToAFPValue(
             mean_accumulator,
             mean_exponent,
-            false
-        );
+            false);
 
-    /*
-     * Approximate division by N.
-     */
-    std::size_t n = input.size();
+    std::size_t n =
+        input.size();
+
     int log_n = 0;
 
     while ((std::size_t{1} << log_n) < n)
@@ -3147,40 +3834,34 @@ AFPEncodedTensor AFPArithmetic::layerNorm(
     mean_value =
         scalePowerOfTwo(
             mean_value,
-            -log_n
-        );
+            -log_n);
 
-    /*
-     * Variance.
-     */
     AFPAccumulator variance_accumulator;
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
             readAFPValue(
                 input,
                 i / block_size,
-                i % block_size
-            );
+                i % block_size);
 
         const AFPValue centered =
             subtractValues(
                 value,
-                mean_value
-            );
+                mean_value);
 
         const AFPProduct square =
             multiplyAFPValues(
                 centered,
-                centered
-            );
+                centered);
 
         variance_accumulator =
             addProducts(
                 variance_accumulator,
-                square
-            );
+                square);
     }
 
     if (variance_accumulator.zero)
@@ -3188,100 +3869,80 @@ AFPEncodedTensor AFPArithmetic::layerNorm(
         return buildTensorFromAFPValues(
             std::vector<AFPValue>(
                 input.size(),
-                zeroValue()
-            ),
-            input.config_
-        );
+                zeroValue()),
+            input.config_);
     }
 
     const int variance_exponent =
         variance_accumulator.exponent +
         integerLog2(
             static_cast<std::uint64_t>(
-                variance_accumulator.significand
-            )
-        );
+                variance_accumulator.significand));
 
     AFPValue variance =
         accumulatorToAFPValue(
             variance_accumulator,
             variance_exponent,
-            false
-        );
+            false);
 
     variance =
         scalePowerOfTwo(
             variance,
-            -log_n
-        );
+            -log_n);
 
-    /*
-     * epsilon = 2^-10.
-     */
     AFPValue epsilon;
 
     epsilon.negative = false;
     epsilon.exponent = -10;
     epsilon.offset = 0;
-    epsilon.mantissa_bits = 5;
-    epsilon.mantissa = std::uint64_t{1} << 5;
-    epsilon.zero = false;
+    epsilon.mantissa =
+        std::uint64_t{1} << 5;
 
     const AFPValue variance_with_epsilon =
         addValues(
             variance,
-            epsilon
-        );
+            epsilon);
 
     const AFPValue denominator =
         sqrtValue(
-            variance_with_epsilon
-        );
+            variance_with_epsilon);
 
-    if (denominator.zero)
+    if (isZeroAFPValue(denominator))
     {
         return buildTensorFromAFPValues(
             std::vector<AFPValue>(
                 input.size(),
-                zeroValue()
-            ),
-            input.config_
-        );
+                zeroValue()),
+            input.config_);
     }
 
-    /*
-     * Normalize.
-     */
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size(); ++i)
+    for (std::size_t i = 0;
+         i < input.size();
+         ++i)
     {
         const AFPValue value =
             readAFPValue(
                 input,
                 i / block_size,
-                i % block_size
-            );
+                i % block_size);
 
         const AFPValue centered =
             subtractValues(
                 value,
-                mean_value
-            );
+                mean_value);
 
         output.push_back(
             divideValues(
                 centered,
-                denominator
-            )
-        );
+                denominator));
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::transpose(
@@ -3289,17 +3950,23 @@ AFPEncodedTensor AFPArithmetic::transpose(
     std::size_t rows,
     std::size_t columns)
 {
-    if (input.size() != rows * columns)
+    if (input.size() !=
+        rows * columns)
+    {
         throw std::invalid_argument(
-            "AFP transpose: tensor size does not match dimensions"
-        );
+            "AFP transpose: tensor size does not match dimensions");
+    }
 
     std::vector<AFPValue> output;
     output.reserve(input.size());
 
-    for (std::size_t column = 0; column < columns; ++column)
+    for (std::size_t column = 0;
+         column < columns;
+         ++column)
     {
-        for (std::size_t row = 0; row < rows; ++row)
+        for (std::size_t row = 0;
+             row < rows;
+             ++row)
         {
             const std::size_t source_index =
                 row * columns + column;
@@ -3308,16 +3975,13 @@ AFPEncodedTensor AFPArithmetic::transpose(
                 readAFPValue(
                     input,
                     source_index / block_size,
-                    source_index % block_size
-                )
-            );
+                    source_index % block_size));
         }
     }
 
     return buildTensorFromAFPValues(
         output,
-        input.config_
-    );
+        input.config_);
 }
 
 AFPEncodedTensor AFPArithmetic::outerProduct(
@@ -3327,37 +3991,39 @@ AFPEncodedTensor AFPArithmetic::outerProduct(
     std::vector<AFPValue> output;
 
     output.reserve(
-        a.size() * b.size()
-    );
+        a.size() *
+        b.size());
 
-    for (std::size_t i = 0; i < a.size(); ++i)
+    for (std::size_t i = 0;
+         i < a.size();
+         ++i)
     {
         const AFPValue av =
             readAFPValue(
                 a,
                 i / block_size,
-                i % block_size
-            );
+                i % block_size);
 
-        for (std::size_t j = 0; j < b.size(); ++j)
+        for (std::size_t j = 0;
+             j < b.size();
+             ++j)
         {
             const AFPValue bv =
                 readAFPValue(
                     b,
                     j / block_size,
-                    j % block_size
-                );
+                    j % block_size);
 
             output.push_back(
-                multiplyValues(av, bv)
-            );
+                multiplyValues(
+                    av,
+                    bv));
         }
     }
 
     return buildTensorFromAFPValues(
         output,
-        a.config_
-    );
+        a.config_);
 }
 
 // ============================================================================
@@ -3369,96 +4035,242 @@ AFPEncodedTensor AFPArithmetic::broadcastAdd(
     const AFPEncodedTensor &b,
     std::size_t target_size)
 {
-    if (a.size() != target_size && a.size() != 1)
-        throw std::invalid_argument("AFP broadcast add: invalid first tensor size");
-    if (b.size() != target_size && b.size() != 1)
-        throw std::invalid_argument("AFP broadcast add: invalid second tensor size");
-    if (a.config_.block_size != b.config_.block_size)
-        throw std::invalid_argument("AFP block size mismatch");
+    if (a.size() != target_size &&
+        a.size() != 1)
+    {
+        throw std::invalid_argument(
+            "AFP broadcast add: invalid first tensor size");
+    }
+
+    if (b.size() != target_size &&
+        b.size() != 1)
+    {
+        throw std::invalid_argument(
+            "AFP broadcast add: invalid second tensor size");
+    }
+
+    if (a.config_.block_size !=
+        b.config_.block_size)
+    {
+        throw std::invalid_argument(
+            "AFP block size mismatch");
+    }
 
     AFPEncodedTensor result;
+
     result.config_ = a.config_;
     result.value_count_ = target_size;
 
-    for (std::size_t block_start = 0; block_start < target_size; block_start += block_size)
+    for (std::size_t block_start = 0;
+         block_start < target_size;
+         block_start += block_size)
     {
-        result.block_offsets_.push_back(result.bits_.bitSize());
+        result.block_offsets_.push_back(
+            result.bits_.bitSize());
 
-        // Compute shared exponent for this block by examining both broadcasts
         int block_shared_exponent = -126;
         bool found_nonzero = false;
 
-        for (std::size_t i = 0; i < block_size && block_start + i < target_size; ++i)
+        for (std::size_t i = 0;
+             i < block_size &&
+             block_start + i < target_size;
+             ++i)
         {
-            const std::size_t a_idx = a.size() == 1 ? 0 : (block_start + i);
-            const std::size_t b_idx = b.size() == 1 ? 0 : (block_start + i);
+            const std::size_t a_idx =
+                a.size() == 1 ?
+                    0 :
+                    block_start + i;
 
-            const AFPValue a_val = readAFPValue(a, a_idx / block_size, a_idx % block_size);
-            const AFPValue b_val = readAFPValue(b, b_idx / block_size, b_idx % block_size);
+            const std::size_t b_idx =
+                b.size() == 1 ?
+                    0 :
+                    block_start + i;
 
-            if (!a_val.zero)
+            const AFPValue a_val =
+                readAFPValue(
+                    a,
+                    a_idx / block_size,
+                    a_idx % block_size);
+
+            const AFPValue b_val =
+                readAFPValue(
+                    b,
+                    b_idx / block_size,
+                    b_idx % block_size);
+
+            if (!isZeroAFPValue(a_val))
             {
-                const int a_eff_exp = a_val.exponent - a_val.offset;
-                if (!found_nonzero || a_eff_exp > block_shared_exponent)
+                const int a_eff_exp =
+                    static_cast<int>(
+                        a_val.exponent) -
+                    static_cast<int>(
+                        a_val.offset);
+
+                if (!found_nonzero ||
+                    a_eff_exp >
+                        block_shared_exponent)
                 {
-                    block_shared_exponent = a_eff_exp;
+                    block_shared_exponent =
+                        a_eff_exp;
+
                     found_nonzero = true;
                 }
             }
 
-            if (!b_val.zero)
+            if (!isZeroAFPValue(b_val))
             {
-                const int b_eff_exp = b_val.exponent - b_val.offset;
-                if (!found_nonzero || b_eff_exp > block_shared_exponent)
+                const int b_eff_exp =
+                    static_cast<int>(
+                        b_val.exponent) -
+                    static_cast<int>(
+                        b_val.offset);
+
+                if (!found_nonzero ||
+                    b_eff_exp >
+                        block_shared_exponent)
                 {
-                    block_shared_exponent = b_eff_exp;
+                    block_shared_exponent =
+                        b_eff_exp;
+
                     found_nonzero = true;
                 }
             }
         }
 
-        // Compute half positivity
         std::vector<AFPValue> block_values;
-        for (std::size_t i = 0; i < block_size && block_start + i < target_size; ++i)
+
+        for (std::size_t i = 0;
+             i < block_size &&
+             block_start + i < target_size;
+             ++i)
         {
-            const std::size_t actual_idx = block_start + i;
-            const std::size_t a_idx = a.size() == 1 ? 0 : actual_idx;
-            const std::size_t b_idx = b.size() == 1 ? 0 : actual_idx;
-            const AFPValue a_val = readAFPValue(a, a_idx / block_size, a_idx % block_size);
-            const AFPValue b_val = readAFPValue(b, b_idx / block_size, b_idx % block_size);
-            const AFPAccumulator acc = addAFPValues(a_val, b_val);
+            const std::size_t actual_idx =
+                block_start + i;
+
+            const std::size_t a_idx =
+                a.size() == 1 ?
+                    0 :
+                    actual_idx;
+
+            const std::size_t b_idx =
+                b.size() == 1 ?
+                    0 :
+                    actual_idx;
+
+            const AFPValue a_val =
+                readAFPValue(
+                    a,
+                    a_idx / block_size,
+                    a_idx % block_size);
+
+            const AFPValue b_val =
+                readAFPValue(
+                    b,
+                    b_idx / block_size,
+                    b_idx % block_size);
+
+            const AFPAccumulator acc =
+                addAFPValues(
+                    a_val,
+                    b_val);
+
             AFPValue result_val;
-            result_val.negative = acc.negative;
-            result_val.zero = acc.zero;
-            block_values.push_back(result_val);
+
+            result_val.negative =
+                acc.negative;
+
+            result_val.exponent =
+                -126;
+
+            result_val.offset =
+                acc.zero ?
+                    maximum_offset :
+                    0;
+
+            result_val.mantissa =
+                acc.zero ?
+                    0 :
+                    32;
+
+            block_values.push_back(
+                result_val);
         }
 
-        const bool first_half_positive = computeHalfPositive(block_values, 0, true);
-        const bool second_half_positive = computeHalfPositive(block_values, 0, false);
+        const bool first_half_positive =
+            computeHalfPositive(
+                block_values,
+                0,
+                true);
 
-        const std::uint8_t characterization = buildCharacterization(first_half_positive, second_half_positive);
+        const bool second_half_positive =
+            computeHalfPositive(
+                block_values,
+                0,
+                false);
 
-        result.bits_.writeBits(encodeSharedExponent(block_shared_exponent), 8);
-        result.bits_.writeBits(characterization, 8);
+        const std::uint8_t characterization =
+            buildCharacterization(
+                first_half_positive,
+                second_half_positive);
 
-        // Write values
-        for (std::size_t i = 0; i < block_size; ++i)
+        result.bits_.writeBits(
+            encodeSharedExponent(
+                block_shared_exponent),
+            8);
+
+        result.bits_.writeBits(
+            characterization,
+            8);
+
+        for (std::size_t i = 0;
+             i < block_size;
+             ++i)
         {
             if (block_start + i >= target_size)
                 break;
 
-            const std::size_t a_idx = a.size() == 1 ? 0 : (block_start + i);
-            const std::size_t b_idx = b.size() == 1 ? 0 : (block_start + i);
+            const std::size_t a_idx =
+                a.size() == 1 ?
+                    0 :
+                    block_start + i;
 
-            const AFPValue a_val = readAFPValue(a, a_idx / block_size, a_idx % block_size);
-            const AFPValue b_val = readAFPValue(b, b_idx / block_size, b_idx % block_size);
+            const std::size_t b_idx =
+                b.size() == 1 ?
+                    0 :
+                    block_start + i;
 
-            const AFPAccumulator acc = addAFPValues(a_val, b_val);
+            const AFPValue a_val =
+                readAFPValue(
+                    a,
+                    a_idx / block_size,
+                    a_idx % block_size);
 
-            const bool positive_field = (i < half_block_size) ? first_half_positive : second_half_positive;
-            const AFPValue afp_result = accumulatorToAFPValue(acc, block_shared_exponent, positive_field);
+            const AFPValue b_val =
+                readAFPValue(
+                    b,
+                    b_idx / block_size,
+                    b_idx % block_size);
 
-            writeAFPValue(result.bits_, afp_result, positive_field);
+            const AFPAccumulator acc =
+                addAFPValues(
+                    a_val,
+                    b_val);
+
+            const bool positive_field =
+                i < half_block_size ?
+                    first_half_positive :
+                    second_half_positive;
+
+            const AFPValue afp_result =
+                accumulatorToAFPValue(
+                    acc,
+                    block_shared_exponent,
+                    positive_field);
+
+            writeAFPValue(
+                result.bits_,
+                afp_result,
+                positive_field);
         }
     }
 
@@ -3470,94 +4282,239 @@ AFPEncodedTensor AFPArithmetic::broadcastMultiply(
     const AFPEncodedTensor &b,
     std::size_t target_size)
 {
-    if (a.size() != target_size && a.size() != 1)
-        throw std::invalid_argument("AFP broadcast multiply: invalid first tensor size");
-    if (b.size() != target_size && b.size() != 1)
-        throw std::invalid_argument("AFP broadcast multiply: invalid second tensor size");
-    if (a.config_.block_size != b.config_.block_size)
-        throw std::invalid_argument("AFP block size mismatch");
+    if (a.size() != target_size &&
+        a.size() != 1)
+    {
+        throw std::invalid_argument(
+            "AFP broadcast multiply: invalid first tensor size");
+    }
+
+    if (b.size() != target_size &&
+        b.size() != 1)
+    {
+        throw std::invalid_argument(
+            "AFP broadcast multiply: invalid second tensor size");
+    }
+
+    if (a.config_.block_size !=
+        b.config_.block_size)
+    {
+        throw std::invalid_argument(
+            "AFP block size mismatch");
+    }
 
     AFPEncodedTensor result;
+
     result.config_ = a.config_;
     result.value_count_ = target_size;
 
-    for (std::size_t block_start = 0; block_start < target_size; block_start += block_size)
+    for (std::size_t block_start = 0;
+         block_start < target_size;
+         block_start += block_size)
     {
-        result.block_offsets_.push_back(result.bits_.bitSize());
+        result.block_offsets_.push_back(
+            result.bits_.bitSize());
 
-        // Compute shared exponent for this block
         int block_shared_exponent = -126;
         bool found_nonzero = false;
 
-        for (std::size_t i = 0; i < block_size && block_start + i < target_size; ++i)
+        for (std::size_t i = 0;
+             i < block_size &&
+             block_start + i < target_size;
+             ++i)
         {
-            const std::size_t a_idx = a.size() == 1 ? 0 : (block_start + i);
-            const std::size_t b_idx = b.size() == 1 ? 0 : (block_start + i);
+            const std::size_t a_idx =
+                a.size() == 1 ?
+                    0 :
+                    block_start + i;
 
-            const AFPValue a_val = readAFPValue(a, a_idx / block_size, a_idx % block_size);
-            const AFPValue b_val = readAFPValue(b, b_idx / block_size, b_idx % block_size);
+            const std::size_t b_idx =
+                b.size() == 1 ?
+                    0 :
+                    block_start + i;
 
-            const AFPProduct prod = multiplyAFPValues(a_val, b_val);
+            const AFPValue a_val =
+                readAFPValue(
+                    a,
+                    a_idx / block_size,
+                    a_idx % block_size);
+
+            const AFPValue b_val =
+                readAFPValue(
+                    b,
+                    b_idx / block_size,
+                    b_idx % block_size);
+
+            const AFPProduct prod =
+                multiplyAFPValues(
+                    a_val,
+                    b_val);
 
             if (!prod.zero)
             {
-                const int prod_eff_exp = prod.scale_exponent + integerLog2(
-                    static_cast<std::uint64_t>(prod.significand));
-                if (!found_nonzero || prod_eff_exp > block_shared_exponent)
+                const int prod_eff_exp =
+                    prod.scale_exponent +
+                    integerLog2(
+                        prod.significand);
+
+                if (!found_nonzero ||
+                    prod_eff_exp >
+                        block_shared_exponent)
                 {
-                    block_shared_exponent = prod_eff_exp;
+                    block_shared_exponent =
+                        prod_eff_exp;
+
                     found_nonzero = true;
                 }
             }
         }
 
-        // Compute half positivity
         std::vector<AFPValue> block_values;
-        for (std::size_t i = 0; i < block_size && block_start + i < target_size; ++i)
+
+        for (std::size_t i = 0;
+             i < block_size &&
+             block_start + i < target_size;
+             ++i)
         {
-            const std::size_t a_idx = a.size() == 1 ? 0 : (block_start + i);
-            const std::size_t b_idx = b.size() == 1 ? 0 : (block_start + i);
-            const AFPValue a_val = readAFPValue(a, a_idx / block_size, a_idx % block_size);
-            const AFPValue b_val = readAFPValue(b, b_idx / block_size, b_idx % block_size);
-            const AFPProduct prod = multiplyAFPValues(a_val, b_val);
+            const std::size_t a_idx =
+                a.size() == 1 ?
+                    0 :
+                    block_start + i;
+
+            const std::size_t b_idx =
+                b.size() == 1 ?
+                    0 :
+                    block_start + i;
+
+            const AFPValue a_val =
+                readAFPValue(
+                    a,
+                    a_idx / block_size,
+                    a_idx % block_size);
+
+            const AFPValue b_val =
+                readAFPValue(
+                    b,
+                    b_idx / block_size,
+                    b_idx % block_size);
+
+            const AFPProduct prod =
+                multiplyAFPValues(
+                    a_val,
+                    b_val);
+
             AFPValue result_val;
-            result_val.negative = prod.negative;
-            result_val.zero = prod.zero;
-            block_values.push_back(result_val);
+
+            result_val.negative =
+                prod.negative;
+
+            result_val.exponent =
+                -126;
+
+            result_val.offset =
+                prod.zero ?
+                    maximum_offset :
+                    0;
+
+            result_val.mantissa =
+                prod.zero ?
+                    0 :
+                    32;
+
+            block_values.push_back(
+                result_val);
         }
 
-        const bool first_half_positive = computeHalfPositive(block_values, block_start, true);
-        const bool second_half_positive = computeHalfPositive(block_values, block_start, false);
+        const bool first_half_positive =
+            computeHalfPositive(
+                block_values,
+                0,
+                true);
 
-        const std::uint8_t characterization = buildCharacterization(first_half_positive, second_half_positive);
+        const bool second_half_positive =
+            computeHalfPositive(
+                block_values,
+                0,
+                false);
 
-        result.bits_.writeBits(encodeSharedExponent(block_shared_exponent), 8);
-        result.bits_.writeBits(characterization, 8);
+        const std::uint8_t characterization =
+            buildCharacterization(
+                first_half_positive,
+                second_half_positive);
 
-        // Write values
-        for (std::size_t i = 0; i < block_size; ++i)
+        result.bits_.writeBits(
+            encodeSharedExponent(
+                block_shared_exponent),
+            8);
+
+        result.bits_.writeBits(
+            characterization,
+            8);
+
+        for (std::size_t i = 0;
+             i < block_size;
+             ++i)
         {
             if (block_start + i >= target_size)
                 break;
 
-            const std::size_t a_idx = a.size() == 1 ? 0 : (block_start + i);
-            const std::size_t b_idx = b.size() == 1 ? 0 : (block_start + i);
+            const std::size_t a_idx =
+                a.size() == 1 ?
+                    0 :
+                    block_start + i;
 
-            const AFPValue a_val = readAFPValue(a, a_idx / block_size, a_idx % block_size);
-            const AFPValue b_val = readAFPValue(b, b_idx / block_size, b_idx % block_size);
+            const std::size_t b_idx =
+                b.size() == 1 ?
+                    0 :
+                    block_start + i;
 
-            const AFPProduct prod = multiplyAFPValues(a_val, b_val);
+            const AFPValue a_val =
+                readAFPValue(
+                    a,
+                    a_idx / block_size,
+                    a_idx % block_size);
+
+            const AFPValue b_val =
+                readAFPValue(
+                    b,
+                    b_idx / block_size,
+                    b_idx % block_size);
+
+            const AFPProduct prod =
+                multiplyAFPValues(
+                    a_val,
+                    b_val);
 
             AFPAccumulator acc;
-            acc.negative = prod.negative;
-            acc.significand = static_cast<std::int64_t>(prod.significand);
-            acc.exponent = prod.scale_exponent;
-            acc.zero = prod.zero;
 
-            const bool positive_field = (i < half_block_size) ? first_half_positive : second_half_positive;
-            const AFPValue afp_result = accumulatorToAFPValue(acc, block_shared_exponent, positive_field);
+            acc.negative =
+                prod.negative;
 
-            writeAFPValue(result.bits_, afp_result, positive_field);
+            acc.significand =
+                static_cast<std::int64_t>(
+                    prod.significand);
+
+            acc.exponent =
+                prod.scale_exponent;
+
+            acc.zero =
+                prod.zero;
+
+            const bool positive_field =
+                i < half_block_size ?
+                    first_half_positive :
+                    second_half_positive;
+
+            const AFPValue afp_result =
+                accumulatorToAFPValue(
+                    acc,
+                    block_shared_exponent,
+                    positive_field);
+
+            writeAFPValue(
+                result.bits_,
+                afp_result,
+                positive_field);
         }
     }
 

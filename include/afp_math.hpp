@@ -224,6 +224,7 @@ public:
     );
 
 private:
+    /*
     struct AFPValue
     {
         bool negative = false;
@@ -233,6 +234,15 @@ private:
         int mantissa_bits = 5;
         bool zero = true;
     };
+    */
+    struct AFPValue
+    {
+        std::int8_t exponent = -126;
+        std::uint8_t offset = 7;
+        std::uint8_t mantissa = 0;
+        bool negative = false;
+    };
+
 
     struct AFPProduct
     {
@@ -445,4 +455,8 @@ private:
     static void normalizeAccumulator(
         AFPAccumulator &acc
     );
+
+    static bool isZeroAFPValue(const AFPValue &value);
+
+    static int mantissaBitsForValue(const AFPValue &value);
 };

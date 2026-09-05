@@ -1,15 +1,18 @@
 #include "../../include/afp_encoded_tensor.hpp"
+#include "../../include/afp_math.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <string>
 #include <vector>
 
 struct TensorData
 {
     std::string name;
-    std::vector<std::uint64_t> shape;
+    std::vector<std::uint64_t>(shape);
     std::vector<float> values;
 };
 
@@ -144,8 +147,7 @@ static bool readFP32Model(
 
         for (std::uint64_t j = 0; j < value_count; ++j)
         {
-            tensor.values[
-                static_cast<std::size_t>(j)] =
+            tensor.values[static_cast<std::size_t>(j)] =
                 readFloat(input);
         }
 
@@ -277,6 +279,18 @@ static bool writeAFPModel(
 
     AFPQuantizer quantizer(config);
 
+    /*
+        Compression totals.
+
+        These measure the numerical tensor data only:
+            FP32 = 4 bytes per value
+            AFP  = encoded bitstream bytes
+    */
+
+    std::uint64_t total_values = 0;
+    std::uint64_t total_fp32_bytes = 0;
+    std::uint64_t total_afp_bytes = 0;
+
     for (const TensorData &tensor : tensors)
     {
         std::cout
@@ -373,6 +387,44 @@ static bool writeAFPModel(
             return false;
         }
 
+        /*
+            Calculate compression statistics.
+        */
+
+        const std::uint64_t value_count =
+            static_cast<std::uint64_t>(
+                tensor.values.size());
+
+        const std::uint64_t fp32_bytes =
+            value_count * sizeof(float);
+
+        const std::uint64_t afp_bytes =
+            static_cast<std::uint64_t>(
+                encoded.byteSize());
+
+        const std::int64_t bytes_saved =
+            static_cast<std::int64_t>(fp32_bytes) - static_cast<std::int64_t>(afp_bytes);
+
+        double savings_percent = 0.0;
+
+        if (fp32_bytes > 0)
+        {
+            savings_percent =
+                (static_cast<double>(bytes_saved) / static_cast<double>(fp32_bytes)) * 100.0;
+        }
+
+        double compression_ratio = 0.0;
+
+        if (afp_bytes > 0)
+        {
+            compression_ratio =
+                static_cast<double>(fp32_bytes) / static_cast<double>(afp_bytes);
+        }
+
+        total_values += value_count;
+        total_fp32_bytes += fp32_bytes;
+        total_afp_bytes += afp_bytes;
+
         std::cout
             << "  Values: "
             << encoded.size()
@@ -398,8 +450,121 @@ static bool writeAFPModel(
             << encoded.blockCount()
             << '\n';
 
+        std::cout
+            << "  FP32 size: "
+            << fp32_bytes
+            << " bytes\n";
+
+        std::cout
+            << "  AFP size: "
+            << afp_bytes
+            << " bytes\n";
+
+        std::cout
+            << "  Savings: "
+            << bytes_saved
+            << " bytes ("
+            << std::fixed
+            << std::setprecision(2)
+            << savings_percent
+            << "%)\n";
+
+        std::cout
+            << "  Compression ratio: "
+            << std::fixed
+            << std::setprecision(2)
+            << compression_ratio
+            << "x\n";
+
         std::cout << '\n';
     }
+
+    /*
+        Print total compression statistics.
+    */
+
+    const std::int64_t total_bytes_saved =
+        static_cast<std::int64_t>(total_fp32_bytes) - static_cast<std::int64_t>(total_afp_bytes);
+
+    double total_savings_percent = 0.0;
+
+    if (total_fp32_bytes > 0)
+    {
+        total_savings_percent =
+            (static_cast<double>(total_bytes_saved) / static_cast<double>(total_fp32_bytes)) * 100.0;
+    }
+
+    double total_compression_ratio = 0.0;
+
+    if (total_afp_bytes > 0)
+    {
+        total_compression_ratio =
+            static_cast<double>(total_fp32_bytes) / static_cast<double>(total_afp_bytes);
+    }
+
+    std::cout
+        << "========================================\n";
+
+    std::cout
+        << "TOTAL COMPRESSION\n";
+
+    std::cout
+        << "========================================\n";
+
+    std::cout
+        << "Total values: "
+        << total_values
+        << '\n';
+
+    std::cout
+        << "FP32 size: "
+        << total_fp32_bytes
+        << " bytes\n";
+
+    std::cout
+        << "AFP size: "
+        << total_afp_bytes
+        << " bytes\n";
+
+    std::cout
+        << "Bytes saved: "
+        << total_bytes_saved
+        << " bytes\n";
+
+    std::cout
+        << "Storage saved: "
+        << std::fixed
+        << std::setprecision(2)
+        << total_savings_percent
+        << "%\n";
+
+    std::cout
+        << "Compression ratio: "
+        << std::fixed
+        << std::setprecision(2)
+        << total_compression_ratio
+        << "x\n";
+
+    std::cout
+        << "FP32 bits/value: "
+        << 32.0
+        << '\n';
+
+    if (total_values > 0)
+    {
+        const double total_afp_bits_per_value =
+            (static_cast<double>(total_afp_bytes) * 8.0) / static_cast<double>(total_values);
+
+        std::cout
+            << "AFP bits/value: "
+            << std::fixed
+            << std::setprecision(2)
+            << total_afp_bits_per_value
+            << '\n';
+    }
+
+    std::cout
+        << "========================================\n\n";
 
     return true;
 }
