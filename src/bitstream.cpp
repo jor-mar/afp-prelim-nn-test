@@ -2,6 +2,14 @@
 
 #include <stdexcept>
 
+void BitStream::loadData(
+    const std::vector<std::uint8_t> &data,
+    std::size_t bit_size)
+{
+    data_ = data;
+    bit_size_ = bit_size;
+}
+
 void BitStream::writeBits(std::uint64_t value, std::size_t bit_count)
 {
     if (bit_count > 64)

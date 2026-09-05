@@ -510,6 +510,27 @@ std::vector<float> AFPQuantizer::decode(const AFPEncodedTensor &encoded) const
     return output;
 }
 
+AFPEncodedTensor AFPQuantizer::load(
+    const std::vector<std::uint8_t> &data,
+    std::size_t bit_size,
+    std::size_t value_count,
+    const AFPConfig &config,
+    const std::vector<std::size_t> &block_offsets) const
+{
+    AFPEncodedTensor result;
+
+    result.config_ = config;
+    result.value_count_ = value_count;
+    result.block_offsets_ = block_offsets;
+
+    result.bits_.loadData(
+        data,
+        bit_size
+    );
+
+    return result;
+}
+
 const AFPConfig &AFPQuantizer::getConfig() const
 {
     return config_;

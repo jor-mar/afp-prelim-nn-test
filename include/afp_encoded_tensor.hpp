@@ -71,6 +71,11 @@ public:
         return block_offsets_.size();
     }
 
+    const std::vector<std::size_t> &blockOffsets() const
+    {
+        return block_offsets_;
+    }
+
     const AFPConfig &config() const
     {
         return config_;
@@ -92,6 +97,12 @@ public:
     AFPEncodedTensor encode(const std::vector<float> &input) const;
 
     std::vector<float> decode(const AFPEncodedTensor &encoded) const;
+
+    AFPEncodedTensor load(
+        const std::vector<std::uint8_t> &data,
+        std::size_t bit_size, std::size_t value_count,
+        const AFPConfig &config,
+        const std::vector<std::size_t> &block_offsets) const;
 
     const AFPConfig &getConfig() const;
 

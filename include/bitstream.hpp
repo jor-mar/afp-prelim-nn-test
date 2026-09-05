@@ -9,6 +9,10 @@ class BitStream
 public:
     BitStream() = default;
 
+    void loadData(
+        const std::vector<std::uint8_t> &data,
+        std::size_t bit_size
+    );
 
     void writeBits(
         std::uint64_t value,

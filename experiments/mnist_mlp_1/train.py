@@ -167,8 +167,8 @@ def main():
     )
     """
     torch.save(
-        SCRIPT_DIR,
-        "mnist_mlp.pth"
+        model.state_dict(),
+        SCRIPT_DIR / "mnist_mlp.pth"
     )
 
     print("\nModel saved to mnist_mlp.pth")
