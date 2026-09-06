@@ -57,7 +57,7 @@ struct AFPModel
     AFPConfig config;
     std::vector<AFPModelTensor> tensors;
 };
-
+/*
 struct InferenceMetrics
 {
     std::chrono::microseconds fp32_time;
@@ -68,7 +68,7 @@ struct InferenceMetrics
     double rmse = 0.0;
     double max_error = 0.0;
 };
-
+*/
 static std::uint32_t readUint32(std::ifstream &file)
 {
     std::uint32_t value = 0;
@@ -530,6 +530,8 @@ struct InferenceTask {
     std::atomic<double>* cumulative_mae;
     std::atomic<double>* cumulative_rmse;
     std::atomic<double>* cumulative_max_error;
+    std::atomic<std::uint64_t>* fp32_elapsed_us;
+    std::atomic<std::uint64_t>* afp_elapsed_us;
 };
 
 /*
@@ -566,6 +568,9 @@ static void processInferenceTask(const InferenceTask& task) {
         
         std::size_t fp32_pred = argmax(fp32_output);
         
+        task.fp32_elapsed_us->fetch_add(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(fp32_end - fp32_start).count()));
+
         // AFP inference
         AFPEncodedTensor afp_input = task.quantizer->encode(image);
         auto afp_start = std::chrono::high_resolution_clock::now();
@@ -591,20 +596,23 @@ static void processInferenceTask(const InferenceTask& task) {
         double mae = calculateMAE(fp32_output, afp_decoded);
         double rmse = calculateRMSE(fp32_output, afp_decoded);
         double max_error = calculateMaxError(fp32_output, afp_decoded);
-        
+
         atomicAdd(*task.cumulative_mae, mae);
         atomicAdd(*task.cumulative_rmse, rmse);
         atomicAdd(*task.cumulative_max_error, max_error);
+
+        task.afp_elapsed_us->fetch_add(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(afp_end - afp_start).count()));
     }
 }
 
 int main()
 {
     try {
-        const std::string fp32_filename = "mnist_mlp_weights.bin";
-        const std::string afp_filename = "mnist_mlp_weights_afp.bin";
-        const std::string images_filename = "../../data/MNIST/raw/t10k-images-idx3-ubyte";
-        const std::string labels_filename = "../../data/MNIST/raw/t10k-labels-idx1-ubyte";
+        const std::string fp32_filename = "experiments/mnist_mlp_1/mnist_mlp_weights.bin";
+        const std::string afp_filename = "experiments/mnist_mlp_1/mnist_mlp_weights_afp.bin";
+        const std::string images_filename = "data/MNIST/raw/t10k-images-idx3-ubyte";
+        const std::string labels_filename = "data/MNIST/raw/t10k-labels-idx1-ubyte";
 
         const std::size_t test_count = 10000;
 
@@ -639,6 +647,8 @@ int main()
         std::atomic<double> cumulative_mae(0.0);
         std::atomic<double> cumulative_rmse(0.0);
         std::atomic<double> cumulative_max_error(0.0);
+        std::atomic<std::uint64_t> fp32_elapsed_us(0);
+        std::atomic<std::uint64_t> afp_elapsed_us(0);
 
         #if ENABLE_PARALLEL_INFERENCE
         std::cout << "Running parallel inference with " << std::thread::hardware_concurrency() << " threads...\n";
@@ -668,6 +678,8 @@ int main()
             task.cumulative_mae = &cumulative_mae;
             task.cumulative_rmse = &cumulative_rmse;
             task.cumulative_max_error = &cumulative_max_error;
+            task.fp32_elapsed_us = &fp32_elapsed_us;
+            task.afp_elapsed_us = &afp_elapsed_us;
             
             tasks.push_back(task);
             threads.emplace_back(processInferenceTask, task);
@@ -716,6 +728,11 @@ int main()
             cumulative_mae += mae;
             cumulative_rmse += rmse;
             cumulative_max_error += max_error;
+
+            fp32_elapsed_us.fetch_add(static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(fp32_end - fp32_start).count()));
+            afp_elapsed_us.fetch_add(static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(afp_end - afp_start).count()));
         }
         #endif
 
@@ -735,6 +752,25 @@ int main()
         std::cout << "MAE: " << std::scientific << std::setprecision(4) << final_mae << '\n';
         std::cout << "RMSE: " << std::scientific << std::setprecision(4) << final_rmse << '\n';
         std::cout << "Max Error: " << std::scientific << std::setprecision(4) << final_max_error << '\n';
+        std::cout << "========================================\n";
+
+        const double count_double = static_cast<double>(count);
+        const double fp32_seconds = static_cast<double>(fp32_elapsed_us.load()) / 1e6;
+        const double afp_seconds = static_cast<double>(afp_elapsed_us.load()) / 1e6;
+        const double delta_seconds = afp_seconds - fp32_seconds;
+        const double fp32_us_per_image = fp32_seconds * 1e6 / count_double;
+        const double afp_us_per_image = afp_seconds * 1e6 / count_double;
+        const double delta_us_per_image = afp_us_per_image - fp32_us_per_image;
+        const double speedup = (afp_seconds > 0.0) ? (fp32_seconds / afp_seconds) : 0.0;
+
+        std::cout << "\n========================================\n";
+        std::cout << "TIME SUMMARY\n";
+        std::cout << "========================================\n";
+        std::cout << std::fixed << std::setprecision(3);
+        std::cout << "FP32 total: " << fp32_seconds << " s (" << fp32_us_per_image << " us/image)\n";
+        std::cout << "AFP total:  " << afp_seconds << " s (" << afp_us_per_image << " us/image)\n";
+        std::cout << "Delta:      " << delta_seconds << " s (" << delta_us_per_image << " us/image)\n";
+        std::cout << "AFP vs FP32: " << std::setprecision(2) << speedup << "x\n";
         std::cout << "========================================\n";
         
         std::cout << "\nOptimizations enabled:\n";
