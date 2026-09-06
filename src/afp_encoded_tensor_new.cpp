@@ -7,6 +7,17 @@
 #include <limits>
 #include <stdexcept>
 
+/*
+    FP32 BOUNDARY
+    -------------
+    This file is the ONLY place in the library where float values are
+    converted to or from AFP representation. encode() takes FP32 tensors
+    from the outside world into AFP; decode() does the reverse. All
+    arithmetic elsewhere (AFP::Value, AFPArithmetic) is AFP-native: it
+    operates on the integer significand/scale-exponent form and never
+    converts to float or double to compute.
+*/
+
 namespace {
     constexpr uint32_t exponent_mask = 0x7F800000U;
     constexpr uint32_t fraction_mask = 0x007FFFFFU;

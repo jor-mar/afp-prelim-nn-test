@@ -6,6 +6,19 @@
 #include <cstdint>
 #include <vector>
 
+/*
+    AFP-NATIVE ARITHMETIC CONTRACT
+    ------------------------------
+    Every operation in AFPArithmetic is computed entirely in AFP
+    representation: tensors are decoded into AFP::Value, arithmetic runs
+    on the integer significand/scale-exponent form (Product/Accumulator),
+    and results are re-encoded with buildTensorFromAFPValues.
+
+    No operation converts AFP data to float/double to perform arithmetic
+    and back. The only sanctioned float conversions in the library are
+    the boundary I/O in AFPQuantizer::encode / AFPQuantizer::decode.
+*/
+
 class AFPArithmetic {
 public:
     // Element-wise operations
@@ -196,6 +209,21 @@ private:
         bool positive_field
     );
 
+    // Bulk block decoding (avoids per-element header re-parsing)
+    static void decodeBlock(
+        const AFPEncodedTensor &tensor,
+        std::size_t block_index,
+        AFP::Value *out_values
+    );
+
+    // Decode a contiguous run of values (row-major, cache-friendly order)
+    static void decodeRow(
+        const AFPEncodedTensor &tensor,
+        std::size_t start_value,
+        std::size_t count,
+        AFP::Value *out_values
+    );
+
     // Block-level operations
     static int computeSharedExponent(
         const std::vector<AFP::Value> &values,
@@ -225,6 +253,12 @@ private:
         const AFPEncodedTensor &b
     );
 
+    // Accumulate a product into a running AFP accumulator
+    static void accumulateProduct(
+        AFP::Accumulator &accumulator,
+        const AFP::Product &product
+    );
+
     // Element-wise operation template for code reuse
     template<typename Op>
     static AFPEncodedTensor elementWiseOp(
@@ -237,14 +271,37 @@ private:
         std::vector<AFP::Value> output;
         output.reserve(a.size());
         
-        for (std::size_t index = 0; index < a.size(); ++index) {
-            const std::size_t block = index / block_size;
-            const std::size_t position = index % block_size;
+        /*
+            Decode each block of both operands once instead of once per
+            element position (common subexpression elimination): block
+            headers are no longer re-parsed for every element, and the
+            two operands are traversed in lockstep for cache locality.
+        */
+        
+        AFP::Value a_block[block_size];
+        AFP::Value b_block[block_size];
+        
+        const std::size_t element_count = a.size();
+        const std::size_t full_blocks = element_count / block_size;
+        
+        for (std::size_t block = 0; block < full_blocks; ++block) {
+            decodeBlock(a, block, a_block);
+            decodeBlock(b, block, b_block);
             
-            const AFP::Value a_value = readAFPValue(a, block, position);
-            const AFP::Value b_value = readAFPValue(b, block, position);
+            for (std::size_t position = 0; position < block_size; ++position) {
+                output.push_back(operation(a_block[position], b_block[position]));
+            }
+        }
+        
+        const std::size_t remainder = element_count % block_size;
+        
+        if (remainder != 0) {
+            decodeBlock(a, full_blocks, a_block);
+            decodeBlock(b, full_blocks, b_block);
             
-            output.push_back(operation(a_value, b_value));
+            for (std::size_t position = 0; position < remainder; ++position) {
+                output.push_back(operation(a_block[position], b_block[position]));
+            }
         }
         
         return buildTensorFromAFPValues(output, a.config_);
@@ -258,12 +315,32 @@ private:
         std::vector<AFP::Value> output;
         output.reserve(input.size());
         
-        for (std::size_t index = 0; index < input.size(); ++index) {
-            const std::size_t block = index / block_size;
-            const std::size_t position = index % block_size;
+        /*
+            Block-at-a-time decoding: shared block header bits are read
+            once per block instead of once per element.
+        */
+        
+        AFP::Value input_block[block_size];
+        
+        const std::size_t element_count = input.size();
+        const std::size_t full_blocks = element_count / block_size;
+        
+        for (std::size_t block = 0; block < full_blocks; ++block) {
+            decodeBlock(input, block, input_block);
             
-            const AFP::Value value = readAFPValue(input, block, position);
-            output.push_back(operation(value));
+            for (std::size_t position = 0; position < block_size; ++position) {
+                output.push_back(operation(input_block[position]));
+            }
+        }
+        
+        const std::size_t remainder = element_count % block_size;
+        
+        if (remainder != 0) {
+            decodeBlock(input, full_blocks, input_block);
+            
+            for (std::size_t position = 0; position < remainder; ++position) {
+                output.push_back(operation(input_block[position]));
+            }
         }
         
         return buildTensorFromAFPValues(output, input.config_);

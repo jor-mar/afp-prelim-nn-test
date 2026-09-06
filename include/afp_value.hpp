@@ -13,6 +13,27 @@ class Accumulator;
  * AFPValue represents a single value in AFP8 format.
  * All arithmetic operations are performed using AFP-native computations
  * without converting to floating-point representation.
+ *
+ * AFP-NATIVE ARITHMETIC CONTRACT
+ * ------------------------------
+ * A Value carries (negative, exponent, offset, mantissa) with an integer
+ * mantissa. Arithmetic never touches float or double:
+ *
+ *   - toProduct()      re-expresses the value as an integer significand
+ *                      plus an integer scale exponent (value = significand
+ *                      * 2^scale_exponent, sign carried separately).
+ *   - Accumulator      accumulates int64 significands at a common integer
+ *                      scale exponent (Utils::normalizeAccumulator).
+ *   - add/subtract/    integer shifts, multiplies and divides only.
+ *     multiply/divide
+ *   - sqrt/exp/tanh/   AFP-native iterations on Value/Product/Accumulator
+ *     sigmoid/...      with hard-coded AFP constants (e.g. Value::half()).
+ *
+ * The ONLY sanctioned float conversions in the library live in the codec
+ * (AFPQuantizer::encode / AFPQuantizer::decode), which translate between
+ * the outside world's FP32 tensors and AFP. Any operation that converts
+ * an AFP value to float/double in order to compute and converts the
+ * result back violates this contract.
  */
 class Value {
 public:
@@ -140,5 +161,19 @@ namespace Utils {
     uint8_t encodeSharedExponent(int exponent);
     void normalizeAccumulator(Accumulator& acc);
 }
+
+/**
+ * Precision control for AFP arithmetic.
+ *
+ * Division internally scales the numerator before the integer divide;
+ * the number of extra precision bits is configurable process-wide.
+ * More bits yield more accurate quotients at the cost of range.
+ * The default (24 bits) matches the original hard-coded value.
+ */
+class Precision {
+public:
+    static void setDivisionPrecisionBits(int bits);
+    static int divisionPrecisionBits();
+};
 
 } // namespace AFP
