@@ -1,0 +1,7 @@
+.freebuff/
+.venv/
+.vscode/
+archive/
+data/
+*.pyt
+*.exe
