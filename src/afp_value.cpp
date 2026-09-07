@@ -2,6 +2,10 @@
 #include <stdexcept>
 #include <algorithm>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace AFP {
 
 // ============================================================================
@@ -10,14 +14,29 @@ namespace AFP {
 
 namespace Utils {
 
+/*
+    Floor log2 via count-leading-zeros. Hardware CLZ/BSR instruction on
+    GCC/Clang/MSVC; portable bit loop otherwise. Bit-exact with the
+    previous shift-loop implementation for every input including 0.
+*/
+
 int integerLog2(uint64_t value) {
     if (value == 0) return -1;
+
+#if defined(__GNUC__) || defined(__clang__)
+    return 63 - static_cast<int>(__builtin_clzll(value));
+#elif defined(_MSC_VER)
+    unsigned long index = 0;
+    _BitScanReverse64(&index, value);
+    return static_cast<int>(index);
+#else
     int result = -1;
     while (value != 0) {
         value >>= 1;
         ++result;
     }
     return result;
+#endif
 }
 
 uint64_t shiftRightRounded(uint64_t value, int shift) {
@@ -72,6 +91,27 @@ void normalizeAccumulator(Accumulator& acc) {
 }
 
 } // namespace Utils
+
+// ============================================================================
+// Precision Control
+// ============================================================================
+
+namespace {
+
+int g_division_precision_bits = 24;
+
+} // namespace
+
+void Precision::setDivisionPrecisionBits(int bits) {
+    if (bits < 0 || bits > 63) {
+        throw std::invalid_argument("AFP division precision must be in [0, 63] bits");
+    }
+    g_division_precision_bits = bits;
+}
+
+int Precision::divisionPrecisionBits() {
+    return g_division_precision_bits;
+}
 
 // ============================================================================
 // Value Implementation
@@ -173,6 +213,11 @@ Product Value::toProduct() const {
 
 // ============================================================================
 // AFP-Native Arithmetic Operations
+//
+// Every operation below runs on the integer significand/scale-exponent
+// form (Product/Accumulator) using integer arithmetic only. None of them
+// converts to float or double; float conversion exists solely in the
+// codec boundary (AFPQuantizer::encode / AFPQuantizer::decode).
 // ============================================================================
 
 Value Value::add(const Value& other) const {
@@ -273,7 +318,7 @@ Value Value::divide(const Value& other) const {
     
     if (numerator.zero) return zero();
     
-    constexpr int division_precision_bits = 24;
+    const int division_precision_bits = Precision::divisionPrecisionBits();
     
     if (numerator.significand > (std::numeric_limits<uint64_t>::max() >> division_precision_bits)) {
         throw std::overflow_error("AFP division numerator overflow");

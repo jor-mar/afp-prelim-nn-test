@@ -1,6 +1,5 @@
-#include "../../include/afp_math.hpp"
-#include "../../include/afp_encoded_tensor.hpp"
-#include "../../include/encoded_tensor.hpp"
+#include "../../include/afp_math_new.hpp"
+#include "../../include/afp_encoded_tensor_new.hpp"
 
 #include <algorithm>
 #include <chrono>

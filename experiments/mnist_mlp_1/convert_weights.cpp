@@ -1,5 +1,5 @@
-#include "../../include/afp_encoded_tensor.hpp"
-#include "../../include/afp_math.hpp"
+#include "../../include/afp_encoded_tensor_new.hpp"
+#include "../../include/afp_math_new.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -12,7 +12,7 @@
 struct TensorData
 {
     std::string name;
-    std::vector<std::uint64_t>(shape);
+    std::vector<std::uint64_t> shape;
     std::vector<float> values;
 };
 
@@ -572,10 +572,10 @@ static bool writeAFPModel(
 int main()
 {
     const std::string input_filename =
-        "experiments/mnist_mlp_1/mnist_mlp_weights.bin";
+        "mnist_mlp_weights.bin";
 
     const std::string output_filename =
-        "experiments/mnist_mlp_1/mnist_mlp_weights_afp.bin";
+        "mnist_mlp_weights_afp.bin";
 
     /*
         Use the normal AFP8 configuration.
