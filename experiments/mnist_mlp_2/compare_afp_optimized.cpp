@@ -146,18 +146,7 @@ struct AFPModel
     AFPConfig config;
     std::vector<AFPModelTensor> tensors;
 };
-/*
-struct InferenceMetrics
-{
-    std::chrono::microseconds fp32_time;
-    std::chrono::microseconds afp_time;
-    double fp32_accuracy = 0.0;
-    double afp_accuracy = 0.0;
-    double mae = 0.0;
-    double rmse = 0.0;
-    double max_error = 0.0;
-};
-*/
+
 static std::uint32_t readUint32(std::ifstream &file)
 {
     std::uint32_t value = 0;
@@ -708,6 +697,7 @@ struct InferenceTask {
     std::atomic<double>* cumulative_rmse;
     std::atomic<double>* cumulative_max_error;
     std::atomic<std::uint64_t>* fp32_elapsed_us;
+    std::atomic<std::uint64_t>* afp_encode_elapsed_us;
     std::atomic<std::uint64_t>* afp_elapsed_us;
 };
 
@@ -742,7 +732,9 @@ static void processInferenceTask(const InferenceTask& task) {
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(fp32_end - fp32_start).count()));
 
         // AFP inference
+        auto afp_encode_start = std::chrono::high_resolution_clock::now();
         AFPEncodedTensor afp_input = task.quantizer->encode(image);
+        auto afp_encode_end = std::chrono::high_resolution_clock::now();
         auto afp_start = std::chrono::high_resolution_clock::now();
         AFPEncodedTensor afp_output = runAFPInference(*task.layers, afp_input);
         auto afp_end = std::chrono::high_resolution_clock::now();
@@ -778,6 +770,8 @@ static void processInferenceTask(const InferenceTask& task) {
 
         task.afp_elapsed_us->fetch_add(
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(afp_end - afp_start).count()));
+        task.afp_encode_elapsed_us->fetch_add(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(afp_encode_end - afp_encode_start).count()));
     }
 }
 
@@ -947,6 +941,7 @@ int main(int argc, char *argv[])
         std::atomic<double> cumulative_rmse(0.0);
         std::atomic<double> cumulative_max_error(0.0);
         std::atomic<std::uint64_t> fp32_elapsed_us(0);
+        std::atomic<std::uint64_t> afp_encode_elapsed_us(0);
         std::atomic<std::uint64_t> afp_elapsed_us(0);
 
         #if ENABLE_PARALLEL_INFERENCE
@@ -979,6 +974,7 @@ int main(int argc, char *argv[])
             task.cumulative_rmse = &cumulative_rmse;
             task.cumulative_max_error = &cumulative_max_error;
             task.fp32_elapsed_us = &fp32_elapsed_us;
+            task.afp_encode_elapsed_us = &afp_encode_elapsed_us;
             task.afp_elapsed_us = &afp_elapsed_us;
             
             tasks.push_back(task);
@@ -1001,8 +997,12 @@ int main(int argc, char *argv[])
             
             std::size_t fp32_pred = argmax(fp32_output);
             
-            // AFP inference
+            // AFP input encoding
+            auto afp_encode_start = std::chrono::high_resolution_clock::now();
             AFPEncodedTensor afp_input = quantizer.encode(image);
+            auto afp_encode_end = std::chrono::high_resolution_clock::now();
+
+            // AFP inference
             auto afp_start = std::chrono::high_resolution_clock::now();
             AFPEncodedTensor afp_output = runAFPInference(layers, afp_input);
             auto afp_end = std::chrono::high_resolution_clock::now();
@@ -1036,6 +1036,8 @@ int main(int argc, char *argv[])
                 std::chrono::duration_cast<std::chrono::microseconds>(fp32_end - fp32_start).count()));
             afp_elapsed_us.fetch_add(static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(afp_end - afp_start).count()));
+            afp_encode_elapsed_us.fetch_add(static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(afp_encode_end - afp_encode_start).count()));
         }
         #endif
 
@@ -1066,19 +1068,22 @@ int main(int argc, char *argv[])
 
         const double count_double = static_cast<double>(count);
         const double fp32_seconds = static_cast<double>(fp32_elapsed_us.load()) / 1e6;
+        const double afp_encode_seconds = static_cast<double>(afp_encode_elapsed_us.load()) / 1e6;
         const double afp_seconds = static_cast<double>(afp_elapsed_us.load()) / 1e6;
         const double delta_seconds = afp_seconds - fp32_seconds;
         const double fp32_us_per_image = fp32_seconds * 1e6 / count_double;
+        const double afp_encode_us_per_image = afp_encode_seconds * 1e6 / count_double;
         const double afp_us_per_image = afp_seconds * 1e6 / count_double;
         const double delta_us_per_image = afp_us_per_image - fp32_us_per_image;
-        const double speedup = (afp_seconds > 0.0) ? (fp32_seconds / afp_seconds) : 0.0;
+        const double speedup = (afp_seconds > 0.0) ? (fp32_us_per_image / afp_us_per_image) : 0.0;
 
         std::cout << "\n========================================\n";
         std::cout << "TIME SUMMARY\n";
         std::cout << "========================================\n";
         std::cout << std::fixed << std::setprecision(3);
         std::cout << "FP32 total: " << fp32_seconds << " s (" << fp32_us_per_image << " us/image)\n";
-        std::cout << "AFP total:  " << afp_seconds << " s (" << afp_us_per_image << " us/image)\n";
+        std::cout << "AFP encode: " << afp_encode_seconds << " s (" << afp_encode_us_per_image << " us/image)\n";
+        std::cout << "AFP inference: " << afp_seconds << " s (" << afp_us_per_image << " us/image)\n";
         std::cout << "Delta:      " << delta_seconds << " s (" << delta_us_per_image << " us/image)\n";
         std::cout << "AFP vs FP32: " << std::setprecision(2) << speedup << "x\n";
         std::cout << "========================================\n";
