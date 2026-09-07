@@ -78,6 +78,7 @@ AFP::Value AFPArithmetic::readAFPValue(
     AFP::Value result;
     result.exponent = static_cast<int8_t>(exponent);
     result.offset = offset;
+    result.positive_field = positive_half;
     
     if (positive_half) {
         mantissa |= static_cast<uint8_t>(first_field << stored_mantissa_bits);
@@ -197,6 +198,7 @@ void AFPArithmetic::decodeBlock(
         AFP::Value result;
         result.exponent = static_cast<int8_t>(exponent);
         result.offset = static_cast<uint8_t>(offset_field);
+        result.positive_field = positive_half;
 
         if (positive_half) {
             mantissa |= first_field << stored_mantissa_bits;

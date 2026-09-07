@@ -552,6 +552,7 @@ Value Value::fromAccumulator(const Accumulator& acc, int shared_exponent, bool p
     Value result;
     result.exponent = static_cast<int8_t>(shared_exponent);
     result.negative = acc.negative;
+    result.positive_field = positive_field;
     
     const int mantissa_bits = positive_field ? 6 : 5;
     

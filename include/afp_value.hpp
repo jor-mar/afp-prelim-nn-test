@@ -38,10 +38,10 @@ class Accumulator;
 class Value {
 public:
     // Constructors
-    constexpr Value() : negative(false), exponent(-126), offset(7), mantissa(0) {}
+    constexpr Value() : negative(false), exponent(-126), offset(7), mantissa(0), positive_field(false) {}
     
-    constexpr Value(bool neg, int8_t exp, uint8_t off, uint8_t mant)
-        : negative(neg), exponent(exp), offset(off), mantissa(mant) {}
+    constexpr Value(bool neg, int8_t exp, uint8_t off, uint8_t mant, bool positive = false)
+        : negative(neg), exponent(exp), offset(off), mantissa(mant), positive_field(positive) {}
     
     // Static factory methods for common constants
     static constexpr Value zero() {
@@ -95,11 +95,17 @@ public:
         return static_cast<int>(exponent) - static_cast<int>(offset);
     }
     
+    /*
+        Width of this value's mantissa field: 6 when the sign bit was
+        reused as a mantissa bit (all-positive half block, recorded by the
+        AFP characterization bit), 5 otherwise. The width is a property of
+        the encoded field, not inferable from the mantissa magnitude: at
+        offset == 7 (no implicit leading 1) a positive-field value may
+        store a raw mantissa below 32, which magnitude sniffing would
+        misread as a 5-bit field and scale 2x too large.
+    */
     int mantissaBits() const {
-        if (offset < 7) {
-            return mantissa >= 64 ? 6 : 5;
-        }
-        return mantissa >= 32 ? 6 : 5;
+        return positive_field ? 6 : 5;
     }
     
     // Conversion helpers for internal use
@@ -112,6 +118,7 @@ public:
     int8_t exponent;
     uint8_t offset;
     uint8_t mantissa;
+    bool positive_field;
     
 private:
     static constexpr int maximum_offset = 7;
