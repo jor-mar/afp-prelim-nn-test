@@ -1,7 +1,7 @@
 #include "../include/afp_math_new.hpp"
+#include "../include/afp_thread_pool.hpp"
 #include <algorithm>
 #include <stdexcept>
-#include <thread>
 #include <vector>
 
 /*
@@ -26,6 +26,32 @@ static std::vector<AFP::Value> makeSingleValue(AFP::Value value) {
     std::vector<AFP::Value> result;
     result.push_back(value);
     return result;
+}
+
+/*
+    Divide total by the element count n for the mean/rms/layerNorm paths.
+
+    The previous call sites used scalePowerOfTwo(-log2_ceil(n)), which
+    divides by the next power of two: for non-power-of-two sizes (e.g.
+    n = 100 -> 128) rms/layerNorm were off by up to ~37%. Dividing
+    through Value::divide is exact in the AFP sense (one rounding step,
+    24-bit division precision) and correct for every n. The count keeps
+    a 5-bit mantissa, so n up to 255 encodes exactly.
+*/
+static AFP::Value divideByCount(const AFP::Value& total, std::size_t n) {
+    AFP::Value count;
+    count.negative = false;
+    count.offset = 0;
+
+    const int n_exponent = AFP::Utils::integerLog2(static_cast<uint64_t>(n));
+    count.exponent = static_cast<int8_t>(n_exponent);
+
+    const uint64_t normalized_n = static_cast<uint64_t>(n) << 5;
+    count.mantissa = static_cast<uint8_t>(
+        AFP::Utils::shiftRightRounded(normalized_n, n_exponent));
+    if (count.mantissa == 0) count.mantissa = 1;
+
+    return total.divide(count);
 }
 
 // ============================================================================
@@ -172,12 +198,47 @@ void AFPArithmetic::decodeBlock(
 
     const std::size_t block_base = tensor.block_offsets_[block_index];
 
-    const int exponent = AFP::Utils::decodeSharedExponent(
-        static_cast<uint8_t>(
-            tensor.bits_.readBits(block_base, shared_exponent_bits)));
+    /*
+        The whole block fits in 160 bits (20 bytes): read it once into
+        three 64-bit windows and extract the 9-bit fields with shifts
+        and masks. Bit-exact with the per-field readBits calls, but one
+        bounds check and one memory sweep per block instead of
+        forty-eight.
+    */
+    constexpr std::size_t block_total_bits = block_header_bits + block_size * value_bits;
+    static_assert(block_total_bits <= 64 + 64 + 64,
+                  "block decode assumes a three-window read");
 
-    const uint8_t characterization = static_cast<uint8_t>(
-        tensor.bits_.readBits(block_base + shared_exponent_bits, characterization_bits));
+    uint64_t w0 = 0, w1 = 0, w2 = 0;
+    {
+        const std::vector<uint8_t> &data = tensor.bits_.data();
+        const std::size_t base_byte = block_base / 8;
+
+        if (data.size() >= base_byte + 20) {
+            for (std::size_t i = 0; i < 8; ++i) {
+                w0 |= static_cast<uint64_t>(data[base_byte + i]) << (8 * i);
+                w1 |= static_cast<uint64_t>(data[base_byte + 8 + i]) << (8 * i);
+            }
+            for (std::size_t i = 0; i < 4; ++i) {
+                w2 |= static_cast<uint64_t>(data[base_byte + 16 + i]) << (8 * i);
+            }
+        } else {
+            /*
+                Truncated/malformed stream: fall back to the bounds-
+                checked per-field reader so the error surfaces exactly
+                as it did before this fast path existed.
+            */
+            for (std::size_t value_index = 0; value_index < block_size; ++value_index) {
+                out_values[value_index] = readAFPValue(tensor, block_index, value_index);
+            }
+            return;
+        }
+    }
+
+    const uint8_t exponent_field = static_cast<uint8_t>(w0 & 0xFF);
+    const int exponent = AFP::Utils::decodeSharedExponent(exponent_field);
+
+    const uint8_t characterization = static_cast<uint8_t>((w0 >> 8) & 0xFF);
 
     const bool first_half_positive =
         (characterization & (uint8_t{1} << first_half_positive_bit)) != 0;
@@ -185,15 +246,34 @@ void AFPArithmetic::decodeBlock(
     const bool second_half_positive =
         (characterization & (uint8_t{1} << second_half_positive_bit)) != 0;
 
-    std::size_t value_base = block_base + block_header_bits;
+    std::size_t bit_position = block_header_bits;
 
     for (std::size_t value_index = 0; value_index < block_size; ++value_index) {
         const bool positive_half =
             value_index < half_block_size ? first_half_positive : second_half_positive;
 
-        const uint64_t first_field = tensor.bits_.readBits(value_base, first_field_bits);
-        const uint64_t offset_field = tensor.bits_.readBits(value_base + first_field_bits, offset_bits);
-        uint64_t mantissa = tensor.bits_.readBits(value_base + first_field_bits + offset_bits, stored_mantissa_bits);
+        /*
+            Extract the 9-bit value field [bit_position, bit_position + 9)
+            from the 144-bit window (w0 holds bits [0, 64), w1 [64, 128),
+            w2 [128, 144)).
+        */
+        uint64_t field;
+        if (bit_position < 56) {
+            field = (w0 >> bit_position) & 0x1FF;
+        } else if (bit_position < 64) {
+            field = ((w0 >> bit_position) | (w1 << (64 - bit_position))) & 0x1FF;
+        } else if (bit_position < 120) {
+            field = (w1 >> (bit_position - 64)) & 0x1FF;
+        } else if (bit_position < 128) {
+            field = ((w1 >> (bit_position - 64)) | (w2 << (128 - bit_position))) & 0x1FF;
+        } else {
+            field = (w2 >> (bit_position - 128)) & 0x1FF;
+        }
+        bit_position += value_bits;
+
+        const uint64_t first_field = field & 1;
+        const uint64_t offset_field = (field >> first_field_bits) & 0x7;
+        uint64_t mantissa = (field >> (first_field_bits + offset_bits)) & 0x1F;
 
         AFP::Value result;
         result.exponent = static_cast<int8_t>(exponent);
@@ -222,7 +302,6 @@ void AFPArithmetic::decodeBlock(
         if (result.isZero()) result.negative = false;
 
         out_values[value_index] = result;
-        value_base += value_bits;
     }
 }
 
@@ -359,6 +438,18 @@ AFPEncodedTensor AFPArithmetic::buildTensorFromAFPValues(
         result.bits_.writeBits(AFP::Utils::encodeSharedExponent(shared_exponent), 8);
         result.bits_.writeBits(characterization, 8);
         
+        /*
+            Encode all 16 slots of the block into a 144-bit payload:
+            each value contributes 9 bits (sign/extra, offset,
+            mantissa). The payload is packed into three 48-bit groups
+            (6 + 5 + 5 fields; every shift stays below 64) and written
+            with three writeBits calls instead of forty-eight. The
+            resulting bitstream is identical.
+        */
+        uint64_t g0 = 0;
+        uint64_t g1 = 0;
+        uint64_t g2 = 0;
+
         for (std::size_t i = 0; i < block_size; ++i) {
             const bool positive_field = i < half_block_size ? first_half_positive : second_half_positive;
             
@@ -378,8 +469,44 @@ AFPEncodedTensor AFPArithmetic::buildTensorFromAFPValues(
                 value.mantissa = 0;
             }
             
-            writeAFPValue(result.bits_, value, positive_field);
+            int field_mantissa_bits = positive_field ? 6 : 5;
+            
+            uint64_t mantissa = 0;
+            
+            if (value.offset < maximum_offset) {
+                const uint64_t implicit = uint64_t{1} << field_mantissa_bits;
+                if (value.mantissa >= implicit) {
+                    mantissa = value.mantissa - implicit;
+                }
+            } else {
+                mantissa = value.mantissa;
+            }
+            
+            uint64_t first_field;
+            if (positive_field) {
+                first_field = mantissa >> 5;
+                mantissa &= 0x1F;
+            } else {
+                first_field = value.negative ? 1 : 0;
+                mantissa &= 0x1F;
+            }
+            
+            const uint64_t field = first_field |
+                (value.offset << 1) |
+                (mantissa << 4);
+            
+            if (i < 6) {
+                g0 |= field << (9 * i);
+            } else if (i < 11) {
+                g1 |= field << (9 * (i - 6));
+            } else {
+                g2 |= field << (9 * (i - 11));
+            }
         }
+        
+        result.bits_.writeBits(g0, 54);
+        result.bits_.writeBits(g1, 45);
+        result.bits_.writeBits(g2, 45);
     }
     
     return result;
@@ -396,53 +523,21 @@ AFPEncodedTensor AFPArithmetic::buildTensorFromAFPValues(
     dotProduct, matrixVectorMultiply, matrixMultiply, softmax, sum,
     sumSquares and layerNorm; centralizing it keeps those routines
     readable and guarantees identical rounding everywhere.
+
+    All accumulation now runs through the single saturating helper in
+    afp_value.cpp (Utils::accumulateProduct), which is well-defined
+    for every exponent gap: the previous inline int64 shifts silently
+    mis-scaled a term whenever the gap to the common exponent reached
+    63 bits (the shift was skipped and the term added at its own
+    scale). For ordinary data the results are bit-identical - the
+    helper's fast path performs the same alignment and rounding.
 */
 
 void AFPArithmetic::accumulateProduct(
     AFP::Accumulator &accumulator,
     const AFP::Product &product)
 {
-    if (product.zero || product.significand == 0) {
-        return;
-    }
-
-    if (accumulator.zero || accumulator.significand == 0) {
-        accumulator.negative = product.negative;
-        accumulator.significand = static_cast<int64_t>(product.significand);
-        accumulator.exponent = product.scale_exponent;
-        accumulator.zero = false;
-        AFP::Utils::normalizeAccumulator(accumulator);
-        return;
-    }
-
-    const int common_exponent =
-        std::min(accumulator.exponent, product.scale_exponent);
-    const int acc_shift = accumulator.exponent - common_exponent;
-    const int prod_shift = product.scale_exponent - common_exponent;
-
-    int64_t acc_value = accumulator.significand;
-    int64_t prod_value = static_cast<int64_t>(product.significand);
-
-    if (acc_shift > 0 && acc_shift < 63) acc_value <<= acc_shift;
-    if (prod_shift > 0 && prod_shift < 63) prod_value <<= prod_shift;
-
-    if (accumulator.negative) acc_value = -acc_value;
-    if (product.negative) prod_value = -prod_value;
-
-    const int64_t sum = acc_value + prod_value;
-
-    if (sum == 0) {
-        accumulator.zero = true;
-        accumulator.negative = false;
-        accumulator.significand = 0;
-        accumulator.exponent = 0;
-    } else {
-        accumulator.negative = sum < 0;
-        accumulator.significand = sum < 0 ? -sum : sum;
-        accumulator.exponent = common_exponent;
-        accumulator.zero = false;
-        AFP::Utils::normalizeAccumulator(accumulator);
-    }
+    AFP::Utils::accumulateProduct(accumulator, product);
 }
 
 void AFPArithmetic::validateCompatible(
@@ -622,52 +717,103 @@ AFPEncodedTensor AFPArithmetic::dotProduct(
 }
 
 // ============================================================================
-// Public Interface - Matrix Operations
+// Prepared Matrices and Unpacked-Value Kernels
 // ============================================================================
 
-AFPEncodedTensor AFPArithmetic::matrixVectorMultiply(
+/*
+    Storage behind AFPPreparedMatrix: the full matrix as AFP::Product
+    entries, decoded once from the AFP bitstream. Products are exactly
+    what Value::toProduct() returns for the same weight, so kernels on
+    the prepared form are bit-exact with the decode-every-call path.
+*/
+
+struct AFPPreparedMatrix::Impl {
+    std::size_t rows = 0;
+    std::size_t columns = 0;
+    std::vector<AFP::Product> products;
+
+    const AFP::Product &at(std::size_t row, std::size_t column) const
+    {
+        return products[row * columns + column];
+    }
+};
+
+AFPPreparedMatrix::AFPPreparedMatrix() : impl_(std::make_unique<Impl>()) {}
+AFPPreparedMatrix::~AFPPreparedMatrix() = default;
+AFPPreparedMatrix::AFPPreparedMatrix(AFPPreparedMatrix &&) noexcept = default;
+AFPPreparedMatrix &AFPPreparedMatrix::operator=(AFPPreparedMatrix &&) noexcept = default;
+
+std::size_t AFPPreparedMatrix::rows() const { return impl_->rows; }
+std::size_t AFPPreparedMatrix::columns() const { return impl_->columns; }
+
+const AFP::Product &AFPPreparedMatrix::product(std::size_t row, std::size_t column) const
+{
+    return impl_->at(row, column);
+}
+
+std::unique_ptr<AFPPreparedMatrix> AFPArithmetic::prepareMatrix(
     const AFPEncodedTensor &weights,
-    const AFPEncodedTensor &input,
     std::size_t rows,
     std::size_t columns)
 {
     if (weights.size() != rows * columns) {
-        throw std::invalid_argument("Weight tensor size doesn't match dimensions");
+        throw std::invalid_argument("AFP prepareMatrix: weight tensor size doesn't match dimensions");
     }
-    if (input.size() != columns) {
-        throw std::invalid_argument("Input tensor size doesn't match columns");
-    }
-    
+
+    auto prepared = std::make_unique<AFPPreparedMatrix>();
+    prepared->impl_->rows = rows;
+    prepared->impl_->columns = columns;
+    prepared->impl_->products.resize(rows * columns);
+
     /*
-        Decode the input vector once instead of once per output row
-        (common subexpression elimination), then compute rows in
-        parallel across hardware threads.
-
-        Each row writes to a distinct output slot, so no locking is
-        needed. Bit-exact with the sequential implementation because
-        the per-row accumulation order is unchanged.
+        Decode all rows once. Each entry stores the exact Product
+        (significand, scale_exponent, sign) that toProduct() returns,
+        so accumulation on the prepared form is bit-identical to the
+        decode-every-call implementation.
     */
+    AFP::Value row[block_size];
+    for (std::size_t r = 0; r < rows; ++r) {
+        const std::size_t base = r * columns;
+        std::size_t done = 0;
+        while (done < columns) {
+            const std::size_t take =
+                (columns - done < block_size) ? (columns - done) : block_size;
+            decodeRow(weights, base + done, take, row);
+            for (std::size_t i = 0; i < take; ++i) {
+                prepared->impl_->products[base + done + i] = row[i].toProduct();
+            }
+            done += take;
+        }
+    }
 
-    std::vector<AFP::Value> input_values(columns);
-    decodeRow(input, 0, columns, input_values.data());
+    return prepared;
+}
 
-    std::vector<AFP::Value> output(rows);
+/*
+    Shared multiply-accumulate core for both prepared entry points.
 
-    std::size_t thread_count = std::thread::hardware_concurrency();
-    if (thread_count == 0) thread_count = 1;
-    if (thread_count > rows) thread_count = rows;
+    Input products are converted once per call (hoisted out of the row
+    loop - previously each input was reconverted once per output row).
+    Row parallelism runs through the process-wide thread pool, so the
+    parallelism stays inside the tensor operation without spawning
+    threads per call and without oversubscribing a parallel caller.
+*/
+
+void AFPArithmetic::preparedMatVecKernel(
+    const AFPPreparedMatrix &prepared,
+    const AFP::Product *input_products,
+    AFP::Value *output)
+{
+    const std::size_t rows = prepared.rows();
+    const std::size_t columns = prepared.columns();
 
     const auto compute_range = [&](std::size_t first_row, std::size_t last_row) {
-        std::vector<AFP::Value> weight_row(columns);
-
         for (std::size_t row = first_row; row < last_row; ++row) {
-            decodeRow(weights, row * columns, columns, weight_row.data());
-
             AFP::Accumulator row_accumulator;
 
             for (std::size_t col = 0; col < columns; ++col) {
-                const AFP::Product product = weight_row[col].toProduct();
-                const AFP::Product prod_input = input_values[col].toProduct();
+                const AFP::Product &product = prepared.product(row, col);
+                const AFP::Product &prod_input = input_products[col];
 
                 AFP::Product combined;
                 combined.negative = product.negative ^ prod_input.negative;
@@ -692,27 +838,162 @@ AFPEncodedTensor AFPArithmetic::matrixVectorMultiply(
         }
     };
 
-    if (thread_count <= 1 || rows * columns < 4096) {
-        compute_range(0, rows);
-    } else {
-        const std::size_t rows_per_thread = (rows + thread_count - 1) / thread_count;
+    AFP::ThreadPool::parallelFor(0, rows, 8, compute_range);
+}
 
-        std::vector<std::thread> threads;
-        threads.reserve(thread_count);
-
-        for (std::size_t t = 0; t < thread_count; ++t) {
-            const std::size_t first_row = t * rows_per_thread;
-            const std::size_t last_row = std::min(first_row + rows_per_thread, rows);
-
-            if (first_row >= last_row) break;
-
-            threads.emplace_back(compute_range, first_row, last_row);
-        }
-
-        for (std::thread &worker : threads) {
-            worker.join();
-        }
+AFPEncodedTensor AFPArithmetic::matrixVectorMultiplyPrepared(
+    const AFPPreparedMatrix &prepared,
+    const AFPEncodedTensor &input)
+{
+    if (input.size() != prepared.columns()) {
+        throw std::invalid_argument("AFP prepared matvec: input size doesn't match columns");
     }
+
+    std::vector<AFP::Value> input_values(prepared.columns());
+    decodeRow(input, 0, prepared.columns(), input_values.data());
+
+    std::vector<AFP::Product> input_products(prepared.columns());
+    for (std::size_t col = 0; col < prepared.columns(); ++col) {
+        input_products[col] = input_values[col].toProduct();
+    }
+
+    std::vector<AFP::Value> output(prepared.rows());
+    preparedMatVecKernel(prepared, input_products.data(), output.data());
+
+    return buildTensorFromAFPValues(output, input.config_);
+}
+
+std::vector<AFP::Value> AFPArithmetic::matrixVectorMultiplyUnpacked(
+    const AFPPreparedMatrix &prepared,
+    const std::vector<AFP::Value> &input)
+{
+    if (input.size() != prepared.columns()) {
+        throw std::invalid_argument("AFP prepared matvec: input size doesn't match columns");
+    }
+
+    std::vector<AFP::Product> input_products(prepared.columns());
+    for (std::size_t col = 0; col < prepared.columns(); ++col) {
+        input_products[col] = input[col].toProduct();
+    }
+
+    std::vector<AFP::Value> output(prepared.rows());
+    preparedMatVecKernel(prepared, input_products.data(), output.data());
+    return output;
+}
+
+std::vector<AFP::Value> AFPArithmetic::addUnpacked(
+    const std::vector<AFP::Value> &a,
+    const std::vector<AFP::Value> &b)
+{
+    if (a.size() != b.size()) {
+        throw std::invalid_argument("AFP addUnpacked: size mismatch");
+    }
+
+    std::vector<AFP::Value> output(a.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        output[i] = a[i].add(b[i]);
+    }
+    return output;
+}
+
+std::vector<AFP::Value> AFPArithmetic::reluUnpacked(const std::vector<AFP::Value> &input)
+{
+    std::vector<AFP::Value> output(input.size());
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        output[i] = input[i].relu();
+    }
+    return output;
+}
+
+AFPEncodedTensor AFPArithmetic::encodeAFPValues(
+    const std::vector<AFP::Value> &values,
+    const AFPConfig &config)
+{
+    return buildTensorFromAFPValues(values, config);
+}
+
+std::vector<AFP::Value> AFPArithmetic::decodeAFPValues(const AFPEncodedTensor &tensor)
+{
+    std::vector<AFP::Value> values(tensor.size());
+    if (!values.empty()) {
+        decodeRow(tensor, 0, tensor.size(), values.data());
+    }
+    return values;
+}
+
+// ============================================================================
+// Public Interface - Matrix Operations
+// ============================================================================
+
+AFPEncodedTensor AFPArithmetic::matrixVectorMultiply(
+    const AFPEncodedTensor &weights,
+    const AFPEncodedTensor &input,
+    std::size_t rows,
+    std::size_t columns)
+{
+    if (weights.size() != rows * columns) {
+        throw std::invalid_argument("Weight tensor size doesn't match dimensions");
+    }
+    if (input.size() != columns) {
+        throw std::invalid_argument("Input tensor size doesn't match columns");
+    }
+    
+    /*
+        Decode the input vector once, hoist the input products out of
+        the row loop (each input was previously reconverted once per
+        output row), and run rows through the shared thread pool.
+
+        Each row writes to a distinct output slot, so no locking is
+        needed. Bit-exact with the sequential implementation because
+        the per-row accumulation order is unchanged.
+    */
+
+    std::vector<AFP::Value> input_values(columns);
+    decodeRow(input, 0, columns, input_values.data());
+
+    std::vector<AFP::Product> input_products(columns);
+    for (std::size_t col = 0; col < columns; ++col) {
+        input_products[col] = input_values[col].toProduct();
+    }
+
+    std::vector<AFP::Value> output(rows);
+
+    const auto compute_range = [&](std::size_t first_row, std::size_t last_row) {
+        std::vector<AFP::Value> weight_row(columns);
+
+        for (std::size_t row = first_row; row < last_row; ++row) {
+            decodeRow(weights, row * columns, columns, weight_row.data());
+
+            AFP::Accumulator row_accumulator;
+
+            for (std::size_t col = 0; col < columns; ++col) {
+                const AFP::Product product = weight_row[col].toProduct();
+                const AFP::Product &prod_input = input_products[col];
+
+                AFP::Product combined;
+                combined.negative = product.negative ^ prod_input.negative;
+                combined.significand = product.significand * prod_input.significand;
+                combined.scale_exponent = product.scale_exponent + prod_input.scale_exponent;
+                combined.zero = combined.significand == 0;
+
+                accumulateProduct(row_accumulator, combined);
+            }
+
+            if (row_accumulator.zero) {
+                output[row] = AFP::Value::zero();
+            } else {
+                const int exponent =
+                    row_accumulator.exponent +
+                    AFP::Utils::integerLog2(
+                        static_cast<uint64_t>(row_accumulator.significand));
+
+                output[row] =
+                    AFP::Value::fromAccumulator(row_accumulator, exponent, false);
+            }
+        }
+    };
+
+    AFP::ThreadPool::parallelFor(0, rows, 8, compute_range);
 
     return buildTensorFromAFPValues(output, weights.config_);
 }
@@ -732,10 +1013,12 @@ AFPEncodedTensor AFPArithmetic::matrixMultiply(
     }
     
     /*
-        Decode B once (it is shared by every output row), then compute
-        output rows in parallel; each row of A is decoded once per row.
+        Decode B once (it is shared by every output row), hoist the B
+        products out of the inner loop (each B element was previously
+        reconverted once per output row), and run output rows through
+        the shared thread pool.
 
-        Each thread writes a distinct row of the output, so no locking
+        Each row writes to a distinct row of the output, so no locking
         is needed. Bit-exact with the sequential implementation because
         the per-element accumulation order is unchanged.
     */
@@ -743,24 +1026,29 @@ AFPEncodedTensor AFPArithmetic::matrixMultiply(
     std::vector<AFP::Value> b_values(cols_a * cols_b);
     decodeRow(b, 0, cols_a * cols_b, b_values.data());
 
-    std::vector<AFP::Value> output(rows_a * cols_b);
+    std::vector<AFP::Product> b_products(cols_a * cols_b);
+    for (std::size_t idx = 0; idx < cols_a * cols_b; ++idx) {
+        b_products[idx] = b_values[idx].toProduct();
+    }
 
-    std::size_t thread_count = std::thread::hardware_concurrency();
-    if (thread_count == 0) thread_count = 1;
-    if (thread_count > rows_a) thread_count = rows_a;
+    std::vector<AFP::Value> output(rows_a * cols_b);
 
     const auto compute_range = [&](std::size_t first_row, std::size_t last_row) {
         std::vector<AFP::Value> a_row(cols_a);
+        std::vector<AFP::Product> a_products(cols_a);
 
         for (std::size_t i = first_row; i < last_row; ++i) {
             decodeRow(a, i * cols_a, cols_a, a_row.data());
+            for (std::size_t k = 0; k < cols_a; ++k) {
+                a_products[k] = a_row[k].toProduct();
+            }
 
             for (std::size_t j = 0; j < cols_b; ++j) {
                 AFP::Accumulator element_accumulator;
 
                 for (std::size_t k = 0; k < cols_a; ++k) {
-                    const AFP::Product product = a_row[k].toProduct();
-                    const AFP::Product prod_b = b_values[k * cols_b + j].toProduct();
+                    const AFP::Product &product = a_products[k];
+                    const AFP::Product &prod_b = b_products[k * cols_b + j];
 
                     AFP::Product combined;
                     combined.negative = product.negative ^ prod_b.negative;
@@ -788,27 +1076,7 @@ AFPEncodedTensor AFPArithmetic::matrixMultiply(
         }
     };
 
-    if (thread_count <= 1 || rows_a * cols_a * cols_b < 4096) {
-        compute_range(0, rows_a);
-    } else {
-        const std::size_t rows_per_thread = (rows_a + thread_count - 1) / thread_count;
-
-        std::vector<std::thread> threads;
-        threads.reserve(thread_count);
-
-        for (std::size_t t = 0; t < thread_count; ++t) {
-            const std::size_t first_row = t * rows_per_thread;
-            const std::size_t last_row = std::min(first_row + rows_per_thread, rows_a);
-
-            if (first_row >= last_row) break;
-
-            threads.emplace_back(compute_range, first_row, last_row);
-        }
-
-        for (std::thread &worker : threads) {
-            worker.join();
-        }
-    }
+    AFP::ThreadPool::parallelFor(0, rows_a, 1, compute_range);
 
     return buildTensorFromAFPValues(output, a.config_);
 }
@@ -826,6 +1094,18 @@ AFPEncodedTensor AFPArithmetic::relu(const AFPEncodedTensor &input)
 
 AFPEncodedTensor AFPArithmetic::sigmoid(const AFPEncodedTensor &input)
 {
+    /*
+        Sigmoid via the exponential definition, 1 / (1 + e^-x):
+
+        - x >= 0: computed directly through the (now correct) exp();
+          for large x the denominator rounds to 1 and the result
+          saturates at 1.
+        - x < 0: computed as e^x / (1 + e^x), which stays accurate for
+          every negative argument (the previous cubic Taylor
+          approximation 0.5 + 0.25x - x^3/48 diverged for x < -1:
+          sigmoid(-10) returned ~19 instead of ~0).
+        - x == 0: exact 0.5.
+    */
     return elementWiseUnaryOp(input, [](const AFP::Value& v) {
         if (v.isZero()) {
             AFP::Value result;
@@ -835,45 +1115,18 @@ AFPEncodedTensor AFPArithmetic::sigmoid(const AFPEncodedTensor &input)
             result.mantissa = 32;
             return result;
         }
-        
-        const AFP::Product prod = v.toProduct();
-        if (prod.scale_exponent >= 2) {
-            AFP::Value result;
-            result.negative = v.negative;
-            result.exponent = v.negative ? -1 : 0;
-            result.offset = v.negative ? 7 : 0;
-            result.mantissa = v.negative ? 0 : 32;
-            return result;
+
+        const AFP::Value one = AFP::Value::one();
+
+        if (!v.isNegative()) {
+            const AFP::Value negated = v.negate();
+            const AFP::Value denominator = one.add(negated.exp());
+            return one.divide(denominator);
         }
-        
-        // Simple sigmoid approximation: 0.5 + 0.25*x - 1/48*x^3
-        AFP::Value half;
-        half.negative = false;
-        half.exponent = -1;
-        half.offset = 0;
-        half.mantissa = 32;
-        
-        AFP::Value quarter;
-        quarter.negative = false;
-        quarter.exponent = -2;
-        quarter.offset = 0;
-        quarter.mantissa = 32;
-        
-        AFP::Value inverse48;
-        inverse48.negative = false;
-        inverse48.exponent = -6;
-        inverse48.offset = 0;
-        inverse48.mantissa = 43;
-        
-        const AFP::Value x2 = v.multiply(v);
-        AFP::Value x3 = x2.multiply(v);
-        x3 = x3.multiply(inverse48);
-        
-        AFP::Value result = half.add(v.multiply(quarter));
-        x3.negative = !x3.negative;
-        result = result.add(x3);
-        
-        return result;
+
+        const AFP::Value e = v.exp();
+        const AFP::Value denominator = one.add(e);
+        return e.divide(denominator);
     });
 }
 
@@ -1005,20 +1258,12 @@ AFPEncodedTensor AFPArithmetic::mean(const AFPEncodedTensor &input)
     
     const AFPEncodedTensor sum_tensor = sum(input);
     const AFP::Value sum_value = readAFPValue(sum_tensor, 0, 0);
-    
-    AFP::Value count;
-    count.negative = false;
-    count.offset = 0;
-    
-    const std::size_t n = input.size();
-    const int n_exponent = AFP::Utils::integerLog2(static_cast<uint64_t>(n));
-    count.exponent = static_cast<int8_t>(n_exponent);
-    
-    const uint64_t normalized_n = static_cast<uint64_t>(n) << 5;
-    count.mantissa = static_cast<uint8_t>(AFP::Utils::shiftRightRounded(normalized_n, n_exponent));
-    if (count.mantissa == 0) count.mantissa = 1;
-    
-    const AFP::Value mean_value = sum_value.divide(count);
+
+    /*
+        Divide by n exactly: correct for every n (the count encoding
+        below keeps 5+ mantissa bits, so n up to 255 is exact).
+    */
+    const AFP::Value mean_value = divideByCount(sum_value, input.size());
     return buildTensorFromAFPValues(makeSingleValue(mean_value), input.config_);
 }
 
@@ -1076,12 +1321,13 @@ AFPEncodedTensor AFPArithmetic::rms(const AFPEncodedTensor &input)
     
     const AFPEncodedTensor sum_squares_tensor = sumSquares(input);
     const AFP::Value total = readAFPValue(sum_squares_tensor, 0, 0);
-    
-    std::size_t n = input.size();
-    int log_n = 0;
-    while ((std::size_t{1} << log_n) < n) ++log_n;
-    
-    const AFP::Value scaled = total.scalePowerOfTwo(-log_n);
+
+    /*
+        Divide by n exactly: scalePowerOfTwo(-log_n) divided by the next
+        power of two, inflating the rms by up to ~37% for non-power-of-two
+        sizes (e.g. n = 100 -> divided by 128).
+    */
+    const AFP::Value scaled = divideByCount(total, input.size());
     const AFP::Value result = scaled.sqrt();
     
     return buildTensorFromAFPValues(makeSingleValue(result), input.config_);
@@ -1136,13 +1382,14 @@ AFPEncodedTensor AFPArithmetic::layerNorm(const AFPEncodedTensor &input)
     
     const AFPEncodedTensor mean_tensor = mean(input);
     const AFP::Value mean_value = readAFPValue(mean_tensor, 0, 0);
-    
-    std::size_t n = input.size();
-    int log_n = 0;
-    while ((std::size_t{1} << log_n) < n) ++log_n;
-    
-    const AFP::Value scaled_mean = mean_value.scalePowerOfTwo(-log_n);
-    
+
+    /*
+        mean() already divides by n exactly; the previous extra
+        scalePowerOfTwo(-log_n) rescaled the mean again by 2^-ceil(log2 n),
+        double-counting the division for non-power-of-two sizes.
+    */
+    const AFP::Value scaled_mean = mean_value;
+
     std::vector<AFP::Value> input_values(input.size());
     decodeRow(input, 0, input.size(), input_values.data());
 
@@ -1166,7 +1413,12 @@ AFPEncodedTensor AFPArithmetic::layerNorm(const AFPEncodedTensor &input)
     
     const int variance_exponent = variance_accumulator.exponent + AFP::Utils::integerLog2(static_cast<uint64_t>(variance_accumulator.significand));
     AFP::Value variance = AFP::Value::fromAccumulator(variance_accumulator, variance_exponent, false);
-    variance = variance.scalePowerOfTwo(-log_n);
+
+    /*
+        Divide by n exactly (see rms): the previous power-of-two
+        rescale inflated the variance by up to ~37%.
+    */
+    variance = divideByCount(variance, input.size());
     
     AFP::Value epsilon;
     epsilon.negative = false;
@@ -1203,10 +1455,25 @@ AFPEncodedTensor AFPArithmetic::transpose(
     std::vector<AFP::Value> output;
     output.reserve(input.size());
     
-    for (std::size_t column = 0; column < columns; ++column) {
-        for (std::size_t row = 0; row < rows; ++row) {
-            const std::size_t source_index = row * columns + column;
-            output.push_back(readAFPValue(input, source_index / block_size, source_index % block_size));
+    /*
+        Decode each source block once and scatter its 16 values to
+        their transposed positions. Previously every element paid a
+        per-value readAFPValue call (three bounds-checked bit reads);
+        for a wide row (columns >> block_size) the same block was
+        re-decoded once per output row, so this also removes the
+        redundant block re-parsing.
+    */
+    std::vector<AFP::Value> block(block_size);
+    
+    for (std::size_t block_index = 0; block_index * block_size < input.size(); ++block_index) {
+        decodeBlock(input, block_index, block.data());
+        
+        const std::size_t block_start = block_index * block_size;
+        for (std::size_t i = 0; i < block_size && block_start + i < input.size(); ++i) {
+            const std::size_t source_index = block_start + i;
+            const std::size_t row = source_index / columns;
+            const std::size_t column = source_index % columns;
+            output[column * rows + row] = block[i];
         }
     }
     
@@ -1220,11 +1487,18 @@ AFPEncodedTensor AFPArithmetic::outerProduct(
     std::vector<AFP::Value> output;
     output.reserve(a.size() * b.size());
     
+    /*
+        Decode both operands once up front (block-at-a-time) instead of
+        re-reading b's blocks once per a element: the inner loop used
+        to re-parse the same 16-value block of b for every outer value.
+    */
+    const std::vector<AFP::Value> a_values = decodeAFPValues(a);
+    const std::vector<AFP::Value> b_values = decodeAFPValues(b);
+    
     for (std::size_t i = 0; i < a.size(); ++i) {
-        const AFP::Value av = readAFPValue(a, i / block_size, i % block_size);
+        const AFP::Value &av = a_values[i];
         for (std::size_t j = 0; j < b.size(); ++j) {
-            const AFP::Value bv = readAFPValue(b, j / block_size, j % block_size);
-            output.push_back(av.multiply(bv));
+            output.push_back(av.multiply(b_values[j]));
         }
     }
     
@@ -1250,12 +1524,24 @@ AFPEncodedTensor AFPArithmetic::broadcastAdd(
     std::vector<AFP::Value> output;
     output.reserve(target_size);
     
+    /*
+        Decode each operand once (block-at-a-time) and reuse the
+        decoded values across the broadcast loop; broadcast operands
+        are usually small (bias-like), so this also caps the extra
+        decode memory.
+    */
+    const std::vector<AFP::Value> a_values =
+        a.size() == target_size ? decodeAFPValues(a) : std::vector<AFP::Value>{};
+    const std::vector<AFP::Value> b_values =
+        b.size() == target_size ? decodeAFPValues(b) : std::vector<AFP::Value>{};
+    
     for (std::size_t i = 0; i < target_size; ++i) {
-        const std::size_t a_idx = a.size() == 1 ? 0 : i;
-        const std::size_t b_idx = b.size() == 1 ? 0 : i;
-        
-        const AFP::Value a_val = readAFPValue(a, a_idx / block_size, a_idx % block_size);
-        const AFP::Value b_val = readAFPValue(b, b_idx / block_size, b_idx % block_size);
+        const AFP::Value a_val =
+            a.size() == 1 ? readAFPValue(a, 0, 0)
+                          : a_values[i];
+        const AFP::Value b_val =
+            b.size() == 1 ? readAFPValue(b, 0, 0)
+                          : b_values[i];
         output.push_back(a_val.add(b_val));
     }
     
@@ -1277,12 +1563,19 @@ AFPEncodedTensor AFPArithmetic::broadcastMultiply(
     std::vector<AFP::Value> output;
     output.reserve(target_size);
     
+    /* Same bulk-decode pattern as broadcastAdd. */
+    const std::vector<AFP::Value> a_values =
+        a.size() == target_size ? decodeAFPValues(a) : std::vector<AFP::Value>{};
+    const std::vector<AFP::Value> b_values =
+        b.size() == target_size ? decodeAFPValues(b) : std::vector<AFP::Value>{};
+    
     for (std::size_t i = 0; i < target_size; ++i) {
-        const std::size_t a_idx = a.size() == 1 ? 0 : i;
-        const std::size_t b_idx = b.size() == 1 ? 0 : i;
-        
-        const AFP::Value a_val = readAFPValue(a, a_idx / block_size, a_idx % block_size);
-        const AFP::Value b_val = readAFPValue(b, b_idx / block_size, b_idx % block_size);
+        const AFP::Value a_val =
+            a.size() == 1 ? readAFPValue(a, 0, 0)
+                          : a_values[i];
+        const AFP::Value b_val =
+            b.size() == 1 ? readAFPValue(b, 0, 0)
+                          : b_values[i];
         output.push_back(a_val.multiply(b_val));
     }
     

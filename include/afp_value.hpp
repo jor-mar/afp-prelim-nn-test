@@ -131,14 +131,22 @@ private:
  */
 class Product {
 public:
-    constexpr Product() : negative(false), significand(0), scale_exponent(0), zero(true) {}
+    /*
+        Member order is deliberate: the two wide fields come first so
+        the struct packs into 16 bytes (8 + 4 + 1 + 1 + 2 padding)
+        instead of 24. AFPPreparedMatrix stores one Product per weight,
+        so this shrinks the weight working set by a third - the hot
+        matrix kernels stream it linearly and pay for every byte.
+        The constructor parameter order is unchanged.
+    */
+    constexpr Product() : significand(0), scale_exponent(0), negative(false), zero(true) {}
     
     constexpr Product(bool neg, uint64_t sig, int exp, bool z)
-        : negative(neg), significand(sig), scale_exponent(exp), zero(z) {}
+        : significand(sig), scale_exponent(exp), negative(neg), zero(z) {}
     
-    bool negative;
     uint64_t significand;
     int scale_exponent;
+    bool negative;
     bool zero;
 };
 
@@ -167,6 +175,18 @@ namespace Utils {
     int decodeSharedExponent(uint8_t encoded);
     uint8_t encodeSharedExponent(int exponent);
     void normalizeAccumulator(Accumulator& acc);
+
+    /*
+        Accumulate one product into a running accumulator.
+
+        Saturation-based and well-defined for every input: exponent
+        alignment happens at a common scale chosen so both terms fit in
+        64-bit unsigned magnitudes, so no signed shift ever overflows
+        and no scale mismatch can silently corrupt the sum. Terms that
+        fall below the accumulator's 64-bit envelope are absorbed with
+        rounding instead of being dropped or mis-scaled.
+    */
+    void accumulateProduct(Accumulator& acc, const Product& product);
 }
 
 /**

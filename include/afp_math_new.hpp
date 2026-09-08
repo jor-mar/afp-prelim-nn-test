@@ -4,7 +4,43 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
+
+/*
+    A dense matrix decoded once from its AFP bitstream at model-load
+    time. Each row holds one AFP::Product per weight: the exact integer
+    significand/scale pair that toProduct() would return, so kernels
+    using it are bit-exact with the decode-every-call implementations.
+
+    The pointed-to representation is an implementation detail; copy
+    semantics are disabled because rows alias the heap buffer.
+*/
+class AFPPreparedMatrix {
+public:
+    AFPPreparedMatrix();
+    ~AFPPreparedMatrix();
+
+    AFPPreparedMatrix(const AFPPreparedMatrix &) = delete;
+    AFPPreparedMatrix &operator=(const AFPPreparedMatrix &) = delete;
+    AFPPreparedMatrix(AFPPreparedMatrix &&) noexcept;
+    AFPPreparedMatrix &operator=(AFPPreparedMatrix &&) noexcept;
+
+    std::size_t rows() const;
+    std::size_t columns() const;
+
+    /*
+        Row-major access: entry (row, column) is the AFP::Product for
+        that weight, ready for the multiply-accumulate kernel.
+    */
+    const AFP::Product &product(std::size_t row, std::size_t column) const;
+
+private:
+    friend class AFPArithmetic;
+
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 /*
     AFP-NATIVE ARITHMETIC CONTRACT
@@ -189,7 +225,72 @@ public:
         std::size_t target_size
     );
 
+    // ------------------------------------------------------------------
+    // Prepared-weight and unpacked-value inference API
+    //
+    // prepareMatrix decodes a weight tensor once (call at model load).
+    //
+    // Static model data (weights) and intermediate activations pay a
+    // heavy decode/encode toll when every operation works on the packed
+    // 9-bit bitstream. The API below keeps the AFP-native contract
+    // (integer significand/scale-exponent arithmetic only) while moving
+    // the conversion cost to where it is paid once:
+    //
+    //   - AFPPreparedMatrix decodes a weight tensor exactly once at
+    //     model load and stores each row as AFP::Product entries.
+    //   - matrixVectorMultiplyPrepared runs the same accumulation as
+    //     matrixVectorMultiply (bit-exact, same rounding) against the
+    //     prepared rows.
+    //   - addUnpacked / reluUnpacked operate on plain AFP::Value
+    //     vectors, and encodeAFPValues packs them back to a tensor.
+    //
+    // Encoding only at I/O boundaries removes the repeated
+    // Value -> Product -> Accumulator -> Value churn between layers
+    // without ever converting to float or double.
+    // ------------------------------------------------------------------
+
+    static std::unique_ptr<AFPPreparedMatrix> prepareMatrix(
+        const AFPEncodedTensor &weights,
+        std::size_t rows,
+        std::size_t columns
+    );
+
+    static AFPEncodedTensor matrixVectorMultiplyPrepared(
+        const AFPPreparedMatrix &prepared,
+        const AFPEncodedTensor &input
+    );
+
+    static std::vector<AFP::Value> matrixVectorMultiplyUnpacked(
+        const AFPPreparedMatrix &prepared,
+        const std::vector<AFP::Value> &input
+    );
+
+    static std::vector<AFP::Value> addUnpacked(
+        const std::vector<AFP::Value> &a,
+        const std::vector<AFP::Value> &b
+    );
+
+    static std::vector<AFP::Value> reluUnpacked(
+        const std::vector<AFP::Value> &input
+    );
+
+    static AFPEncodedTensor encodeAFPValues(
+        const std::vector<AFP::Value> &values,
+        const AFPConfig &config
+    );
+
+    static std::vector<AFP::Value> decodeAFPValues(
+        const AFPEncodedTensor &tensor
+    );
+
 private:
+    // Shared kernel behind matrixVectorMultiplyPrepared / matrixVectorMultiplyUnpacked
+    static void preparedMatVecKernel(
+        const AFPPreparedMatrix &prepared,
+        const AFP::Product *input_products,
+        AFP::Value *output
+    );
+
     // Constants
     static constexpr std::size_t block_size = 16;
     static constexpr std::size_t half_block_size = 8;

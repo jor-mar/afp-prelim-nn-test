@@ -456,6 +456,52 @@ static std::vector<float> runFP32Inference(
     return layer3;
 }
 
+/*
+    Decode a single-value tensor (e.g. a bias) into its AFP::Value form.
+*/
+static AFP::Value singleValueOf(const AFPEncodedTensor &tensor)
+{
+    return AFPArithmetic::decodeAFPValues(tensor).at(0);
+}
+
+/*
+    AFP inference over the prepared-weight + unpacked-value pipeline:
+
+    - weights are decoded/converted once at model load (AFPPreparedMatrix)
+      instead of re-parsing the bitstream for every image;
+    - activations stay as unpacked AFP::Value vectors between layers,
+      removing the encode/decode churn of add/relu; encoding happens
+      only at the I/O boundary;
+    - all arithmetic is still AFP-native (integer Product/Accumulator),
+      and the per-layer rounding is identical to the packed pipeline
+      (verified bit-exact in tests/test_afp_equivalence.cpp).
+*/
+static std::vector<AFP::Value> runAFPInferencePrepared(
+    const AFPPreparedMatrix &fc1_weight,
+    const AFP::Value &fc1_bias,
+    const AFPPreparedMatrix &fc2_weight,
+    const AFP::Value &fc2_bias,
+    const AFPPreparedMatrix &fc3_weight,
+    const AFP::Value &fc3_bias,
+    const std::vector<AFP::Value> &input)
+{
+    std::vector<AFP::Value> layer1 =
+        AFPArithmetic::matrixVectorMultiplyUnpacked(fc1_weight, input);
+    for (AFP::Value &v : layer1) v = v.add(fc1_bias);
+    layer1 = AFPArithmetic::reluUnpacked(layer1);
+
+    std::vector<AFP::Value> layer2 =
+        AFPArithmetic::matrixVectorMultiplyUnpacked(fc2_weight, layer1);
+    for (AFP::Value &v : layer2) v = v.add(fc2_bias);
+    layer2 = AFPArithmetic::reluUnpacked(layer2);
+
+    std::vector<AFP::Value> layer3 =
+        AFPArithmetic::matrixVectorMultiplyUnpacked(fc3_weight, layer2);
+    for (AFP::Value &v : layer3) v = v.add(fc3_bias);
+
+    return layer3;
+}
+
 static AFPEncodedTensor runAFPInference(
     const AFPEncodedTensor &fc1_weight,
     const AFPEncodedTensor &fc1_bias,
@@ -558,6 +604,22 @@ static void processInferenceTask(const InferenceTask& task) {
     const AFPEncodedTensor &afp_fc3_weight = findAFPTensor(*task.afp_model, "fc3.weight");
     const AFPEncodedTensor &afp_fc3_bias = findAFPTensor(*task.afp_model, "fc3.bias");
 
+    /*
+        Prepared weights + decoded biases: paid once per task, not once
+        per image. Tasks are non-overlapping ranges of images, so each
+        matrix is prepared exactly once per process.
+    */
+    const std::unique_ptr<AFPPreparedMatrix> fc1_prepared =
+        AFPArithmetic::prepareMatrix(afp_fc1_weight, 128, 784);
+    const std::unique_ptr<AFPPreparedMatrix> fc2_prepared =
+        AFPArithmetic::prepareMatrix(afp_fc2_weight, 64, 128);
+    const std::unique_ptr<AFPPreparedMatrix> fc3_prepared =
+        AFPArithmetic::prepareMatrix(afp_fc3_weight, 10, 64);
+
+    const AFP::Value fc1_bias_value = singleValueOf(afp_fc1_bias);
+    const AFP::Value fc2_bias_value = singleValueOf(afp_fc2_bias);
+    const AFP::Value fc3_bias_value = singleValueOf(afp_fc3_bias);
+
     for (std::size_t i = task.start_idx; i < task.end_idx; ++i) {
         const std::vector<float> &image = (*task.images)[i];
         
@@ -571,15 +633,18 @@ static void processInferenceTask(const InferenceTask& task) {
         task.fp32_elapsed_us->fetch_add(
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(fp32_end - fp32_start).count()));
 
-        // AFP inference
+        // AFP inference (prepared weights, unpacked activations)
         AFPEncodedTensor afp_input = task.quantizer->encode(image);
         auto afp_start = std::chrono::high_resolution_clock::now();
-        AFPEncodedTensor afp_output = runAFPInference(afp_fc1_weight, afp_fc1_bias, 
-                                                     afp_fc2_weight, afp_fc2_bias,
-                                                     afp_fc3_weight, afp_fc3_bias, afp_input);
+        std::vector<AFP::Value> afp_output_values = runAFPInferencePrepared(
+            *fc1_prepared, fc1_bias_value,
+            *fc2_prepared, fc2_bias_value,
+            *fc3_prepared, fc3_bias_value,
+            AFPArithmetic::decodeAFPValues(afp_input));
         auto afp_end = std::chrono::high_resolution_clock::now();
         
-        std::vector<float> afp_decoded = task.quantizer->decode(afp_output);
+        std::vector<float> afp_decoded = task.quantizer->decode(
+            AFPArithmetic::encodeAFPValues(afp_output_values, task.quantizer->getConfig()));
         std::size_t afp_pred = argmax(afp_decoded);
         
         // Calculate accuracy against the true MNIST label
@@ -631,13 +696,6 @@ int main()
         if (count == 0) throw std::runtime_error("No MNIST test images found.");
 
         std::cout << "\nLoaded " << count << " test images.\n\n";
-
-        const AFPEncodedTensor &afp_fc1_weight = findAFPTensor(afp_model, "fc1.weight");
-        const AFPEncodedTensor &afp_fc1_bias = findAFPTensor(afp_model, "fc1.bias");
-        const AFPEncodedTensor &afp_fc2_weight = findAFPTensor(afp_model, "fc2.weight");
-        const AFPEncodedTensor &afp_fc2_bias = findAFPTensor(afp_model, "fc2.bias");
-        const AFPEncodedTensor &afp_fc3_weight = findAFPTensor(afp_model, "fc3.weight");
-        const AFPEncodedTensor &afp_fc3_bias = findAFPTensor(afp_model, "fc3.bias");
 
         AFPQuantizer quantizer(afp_model.config);
 
